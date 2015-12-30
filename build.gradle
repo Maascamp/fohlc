@@ -1,0 +1,29 @@
+group 'com.maascamp.folc'
+version '1.0-SNAPSHOT'
+
+apply plugin: 'java'
+apply plugin: 'idea'
+apply plugin: 'eclipse'
+
+sourceCompatibility = JavaVersion.VERSION_1_8
+targetCompatibility = JavaVersion.VERSION_1_8
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    compile 'com.google.guava:guava:19.0'
+    compile 'com.google.code.findbugs:jsr305:3.0.1'
+
+    testCompile 'junit:junit:4.12'
+}
+
+compileJava {
+    options.compilerArgs << '-XDignore.symbol.file'
+    options.compilerArgs << "-Xlint:unchecked" << "-Xlint:deprecation"
+}
+
+compileTestJava {
+    options.compilerArgs << '-XDignore.symbol.file'
+}
