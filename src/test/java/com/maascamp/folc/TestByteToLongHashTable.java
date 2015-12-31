@@ -50,11 +50,11 @@ public class TestByteToLongHashTable {
 
   @Test
   public void testGetAndPutIfEmpty() {
-    long existing = cache.getAndPutIfEmpty("test".getBytes(), 100L);
-    assertEquals(existing, ByteToLongHashTable.NOT_FOUND);
+    Long existing = cache.getAndPutIfEmpty("test".getBytes(), 100L);
+    assertEquals(existing, null);
 
     existing = cache.getAndPutIfEmpty("test".getBytes(), 200L);
-    assertEquals(existing, 100L);
+    assertTrue(existing == 100L);
   }
 
   @Test

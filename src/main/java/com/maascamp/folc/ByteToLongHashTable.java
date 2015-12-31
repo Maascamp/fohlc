@@ -16,32 +16,55 @@ import javax.annotation.concurrent.GuardedBy;
 
 public class ByteToLongHashTable {
 
-  public static final long NOT_FOUND = -1L;
-
-  /* each bucket is 24 bytes wide (64 bit key + 64 bit val + 64 bit pointer) */
+  /**
+   * Buckets are 24 bytes wide.
+   * 64 bit key + 64 bit value + 64 bit pointer to next bucket.
+   */
   private static final int BUCKET_SIZE = 24;
-  private static final int BUCKET_VALUE_OFFSET = 8;
-  private static final int BUCKET_POINTER_OFFSET = 16;
+
+  /**
+   * Byte offset of the value within a bucket.
+   */
+  private static final int VALUE_OFFSET = 8;
+
+  /**
+   * Byte offset of the next bucket pointer within a bucket.
+   */
+  private static final int POINTER_OFFSET = 16;
+
+  /**
+   * Load factor threshold beyond which eviction begins.
+   */
   private static final double EVICTION_THRESHOLD = 0.85;
+
   private static final long EMPTY = 0L;
 
-  // Hopscotch values
+  /**
+   * Neighborhood for linear probing.
+   * See <a href="https://en.wikipedia.org/wiki/Hopscotch_hashing">
+   * Hopscotch Hashing</a>
+   */
   private static final int NEIGHBORHOOD = 64;
+
+  /**
+   * Maximum number of probes for an empty bucket before we
+   * declare failure. The chances of not finding an open slot
+   * in {@link #NEIGHBORHOOD} probes is 1/{@link #NEIGHBORHOOD}! (factorial)
+   */
   private static final int PROBE_MAX = 8192;
 
-  // Write bookkeeping for lock amortization.
+  // Bookkeeping properties for async bookkeeping.
   // see https://github.com/ben-manes/concurrentlinkedhashmap/wiki/Design
   private final Lock evictionLock;
   private final Queue<Runnable> taskBuffer;
   private final AtomicReference<DrainStatus> drainStatus;
   private static final int WRITE_BUFFER_DRAIN_THRESHOLD = 16;
 
-  private final Unsafe unsafe;
-  private final HashFunction hashFunction;
   private final long sizeInBytes;
   private final long numBuckets;
   private final long memStart;
-
+  private final Unsafe unsafe;
+  private final HashFunction hashFunction;
   private final AtomicLong numEntries = new AtomicLong(0L);
   private final AtomicLong hits = new AtomicLong(0L);
   private final AtomicLong misses = new AtomicLong(0L);
@@ -63,10 +86,18 @@ public class ByteToLongHashTable {
     this.unsafe.setMemory(this.memStart, this.sizeInBytes, (byte) 0); // zero out memory
   }
 
+  /**
+   * Release the off-heap memory associated with this cache.
+   */
   public void destroy() {
     unsafe.freeMemory(memStart);
   }
 
+  /**
+   * Generate a CacheMetrics object representing the current state
+   * of the cache.
+   * @return {@link CacheMetrics}
+   */
   public CacheMetrics getCacheMetrics() {
     return new CacheMetrics(
       sizeInBytes,
@@ -80,60 +111,75 @@ public class ByteToLongHashTable {
   }
 
   /**
+   * Associate the specified value with the specified key in the cache
+   * if the key does not currently exist in the cache.
    *
-   * NOTE: A zero value is assumed to be empty by the cache!
+   * If the key already exists in the cache this method is a no-op.
    */
-  public void put(byte[] key, long val) {
+  public void put(byte[] key, long value) {
     // if hash table already contains value do nothing
-    final long result = _get(key);
-    if (result == NOT_FOUND) {
-      _put(key, val);
+    final Long val = _get(key);
+    if (val == null) {
+      _put(key, value);
     }
   }
 
   /**
-   * Insert using Hopscotch hashing for collision resolution.
+   * Unconditionally associate the specified value with the specified key.
    */
   private void _put(byte[] key, long value) {
     final long hashCode = hash(key);
     long index = getIndex(hashCode);
 
+    // keep trying until we get a stable write
     for (;;) {
       long address = addressFromIndex(findAvailableBucket(index));
       if (unsafe.compareAndSwapLong(null, address, EMPTY, hashCode)) {
-        unsafe.putLongVolatile(null, address + BUCKET_VALUE_OFFSET, value);
+        unsafe.putLongVolatile(null, address + VALUE_OFFSET, value);
         queueWrite(new WriteTask(address)); // queue the bookkeeping for async processing
         return;
       }
     }
   }
 
-  public long get(byte[] key) {
-    final long result = _get(key);
-    if (result == NOT_FOUND) {
+  /**
+   * Return the value associated with the specified key.
+   *
+   * @return The value associated with the specified key or null
+   * if it doesn't exist.
+   */
+  public Long get(byte[] key) {
+    final Long val = _get(key);
+    if (val == null) {
       misses.incrementAndGet();
     } else {
       hits.incrementAndGet();
     }
-    return result;
+    return val;
   }
 
-  public long getAndPutIfEmpty(byte[] key, long value) {
-    long foundVal = _get(key);
-    if (foundVal == NOT_FOUND) {
+  /**
+   * Return the value associated with the specified key if it exists.
+   * If the key does not exist, execute a {@link #put(byte[], long)}.
+   *
+   * @return The associated value if it exists or null
+   */
+  public Long getAndPutIfEmpty(byte[] key, long value) {
+    final Long val = _get(key);
+    if (val == null) {
       _put(key, value);
       misses.incrementAndGet();
-      return NOT_FOUND;
+      return null;
     }
 
     hits.incrementAndGet();
-    return foundVal;
+    return val;
   }
 
   /**
    * Since we use hopscotch hashing, key is guaranteed to be within H steps of index.
    */
-  private long _get(byte[] key) {
+  private Long _get(byte[] key) {
     final long hashCode = hash(key);
     long index = getIndex(hashCode);
 
@@ -143,12 +189,12 @@ public class ByteToLongHashTable {
       long bucketHashCode = unsafe.getLong(addressFromIndex((index + i) % numBuckets));
       if (bucketHashCode == hashCode) {
         // we've found it so return the corresponding value
-        return unsafe.getLong(addressFromIndex((index + i) % numBuckets) + BUCKET_VALUE_OFFSET);
+        return unsafe.getLong(addressFromIndex((index + i) % numBuckets) + VALUE_OFFSET);
       }
     }
 
     // if we got here the value does not exist in the hash table
-    return NOT_FOUND;
+    return null;
   }
 
   private long findAvailableBucket(long index) {
@@ -197,11 +243,11 @@ public class ByteToLongHashTable {
               emptyAddress,
               unsafe.getLong(candidateAddress));
           unsafe.putLong( // swap value
-              emptyAddress + BUCKET_VALUE_OFFSET,
-              unsafe.getLong(candidateAddress + BUCKET_VALUE_OFFSET));
+              emptyAddress + VALUE_OFFSET,
+              unsafe.getLong(candidateAddress + VALUE_OFFSET));
           unsafe.putLong( // swap pointer
-              emptyAddress + BUCKET_POINTER_OFFSET,
-              unsafe.getLong(candidateAddress + BUCKET_POINTER_OFFSET));
+              emptyAddress + POINTER_OFFSET,
+              unsafe.getLong(candidateAddress + POINTER_OFFSET));
 
           // empty out candidate
           unsafe.setMemory(candidateAddress, BUCKET_SIZE, (byte) 0);
@@ -269,7 +315,7 @@ public class ByteToLongHashTable {
         long address = fifoHead.get();
         long hashCode = unsafe.getLongVolatile(null, address);
         if (unsafe.compareAndSwapLong(null, address, hashCode, EMPTY)) {
-          fifoHead.set(unsafe.getLong(address + BUCKET_POINTER_OFFSET));
+          fifoHead.set(unsafe.getLong(address + POINTER_OFFSET));
           deleteBucket(address);
           numEntries.decrementAndGet();
           evictions.incrementAndGet();
@@ -335,12 +381,12 @@ public class ByteToLongHashTable {
       } else {
         // update the previous entry's pointer to  point to the new
         // entry and update the tail pointer
-        unsafe.putLongVolatile(null, fifoTail.get() + BUCKET_POINTER_OFFSET, address);
+        unsafe.putLongVolatile(null, fifoTail.get() + POINTER_OFFSET, address);
         fifoTail.set(address);
       }
 
       // set the newly added entry's pointer to NOT_FOUND
-      unsafe.putLongVolatile(null, address + BUCKET_POINTER_OFFSET, -1L);
+      unsafe.putLongVolatile(null, address + POINTER_OFFSET, -1L);
     }
   }
 }
