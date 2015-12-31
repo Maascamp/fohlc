@@ -16,13 +16,14 @@ import javax.annotation.concurrent.GuardedBy;
 
 public class ByteToLongHashTable {
 
+  public static final long NOT_FOUND = -1L;
+
   /* each bucket is 24 bytes wide (64 bit key + 64 bit val + 64 bit pointer) */
   private static final int BUCKET_SIZE = 24;
   private static final int BUCKET_VALUE_OFFSET = 8;
   private static final int BUCKET_POINTER_OFFSET = 16;
   private static final double EVICTION_THRESHOLD = 0.85;
-  private static final long EMPTY_VAL = 0L;
-  private static final long NOT_FOUND = -1L;
+  private static final long EMPTY = 0L;
 
   // Hopscotch values
   private static final int NEIGHBORHOOD = 64;
@@ -38,10 +39,13 @@ public class ByteToLongHashTable {
   private final Unsafe unsafe;
   private final HashFunction hashFunction;
   private final long sizeInBytes;
-  private final long memStart;
   private final long numBuckets;
+  private final long memStart;
 
   private final AtomicLong numEntries = new AtomicLong(0L);
+  private final AtomicLong hits = new AtomicLong(0L);
+  private final AtomicLong misses = new AtomicLong(0L);
+  private final AtomicLong evictions = new AtomicLong(0L);
   private final AtomicLong fifoHead = new AtomicLong(-1L);
   private final AtomicLong fifoTail = new AtomicLong(-1L);
 
@@ -63,38 +67,32 @@ public class ByteToLongHashTable {
     unsafe.freeMemory(memStart);
   }
 
-  public long getSize() {
-    return numEntries.get();
-  }
-
-  public long getSizeInBytes() {
-    return sizeInBytes;
-  }
-
-  public double getLoadFactor() {
-    return ((double) Math.round(((double) numEntries.get() / (double) numBuckets) * 100)) / 100;
+  public CacheMetrics getCacheMetrics() {
+    return new CacheMetrics(
+      sizeInBytes,
+      numBuckets,
+      numEntries.get(),
+      getLoadFactor(),
+      hits.get(),
+      misses.get(),
+      evictions.get()
+    );
   }
 
   /**
    *
    * NOTE: A zero value is assumed to be empty by the cache!
-   *
-   * @param val
-   * @return
    */
   public void put(byte[] key, long val) {
     // if hash table already contains value do nothing
-    final long current = _get(key);
-    if (current == NOT_FOUND) {
+    final long result = _get(key);
+    if (result == NOT_FOUND) {
       _put(key, val);
     }
   }
 
   /**
    * Insert using Hopscotch hashing for collision resolution.
-   * @param key
-   * @param value
-   * @return
    */
   private void _put(byte[] key, long value) {
     final long hashCode = hash(key);
@@ -102,7 +100,7 @@ public class ByteToLongHashTable {
 
     for (;;) {
       long address = addressFromIndex(findAvailableBucket(index));
-      if (unsafe.compareAndSwapLong(null, address, EMPTY_VAL, hashCode)) {
+      if (unsafe.compareAndSwapLong(null, address, EMPTY, hashCode)) {
         unsafe.putLongVolatile(null, address + BUCKET_VALUE_OFFSET, value);
         queueWrite(new WriteTask(address)); // queue the bookkeeping for async processing
         return;
@@ -111,16 +109,24 @@ public class ByteToLongHashTable {
   }
 
   public long get(byte[] key) {
-    return _get(key);
+    final long result = _get(key);
+    if (result == NOT_FOUND) {
+      misses.incrementAndGet();
+    } else {
+      hits.incrementAndGet();
+    }
+    return result;
   }
 
   public long getAndPutIfEmpty(byte[] key, long value) {
     long foundVal = _get(key);
     if (foundVal == NOT_FOUND) {
       _put(key, value);
+      misses.incrementAndGet();
       return NOT_FOUND;
     }
 
+    hits.incrementAndGet();
     return foundVal;
   }
 
@@ -148,44 +154,43 @@ public class ByteToLongHashTable {
   private long findAvailableBucket(long index) {
     // see if we find a free bucket in the neighborhood
     for (int i=0; i < NEIGHBORHOOD; i++) {
-      long bucketHashCode = unsafe.getLong(addressFromIndex((index + i) % numBuckets));
-      if (bucketHashCode == EMPTY_VAL) {
+      long candidateIndex = (index + i) % numBuckets;
+      long bucketHashCode = unsafe.getLongVolatile(null, addressFromIndex(candidateIndex));
+      if (bucketHashCode == EMPTY) {
         // we've found it so return the index
-        return index + i;
+        return candidateIndex;
       }
     }
 
     // if we got here we were unable to find an empty bucket in the neighborhood
-    boolean found = false;
-    long currentIndex = index + NEIGHBORHOOD;
+    long emptyIndex = -1L;
+    long probeStart = index + NEIGHBORHOOD;
     for (int i=0; i < PROBE_MAX; i += BUCKET_SIZE) {
-      long bucketHashCode = unsafe.getLong(addressFromIndex((index + i) % numBuckets));
-      if (bucketHashCode == EMPTY_VAL) {
-        found = true;
+      long bucketHashCode = unsafe.getLongVolatile(null, addressFromIndex((probeStart + i) % numBuckets));
+      if (bucketHashCode == EMPTY) {
+        emptyIndex = (probeStart + i) % numBuckets;
         break;
       }
     }
 
-    if (!found) {
+    if (emptyIndex < 0) {
       throw new RuntimeException(String.format(
           "Unable to find a empty bucket after examining %d buckets", PROBE_MAX));
     }
 
     // now we swap back until the empty bucket is in the neighborhood
-    int numSwaps = 0;
-    long emptyIndex = currentIndex;
-    long emptyAddress = addressFromIndex(emptyIndex % numBuckets);
+    long emptyAddress = addressFromIndex(emptyIndex);
     while (emptyIndex - index > NEIGHBORHOOD) {
       boolean foundSwap = false;
       long minBaseIndex = emptyIndex - (NEIGHBORHOOD - 1);
       for(int i = NEIGHBORHOOD - 1; i > 0; i--) {
-        long candidate = emptyIndex - i;
-        if (candidate < index) {
+        long candidateIndex = emptyIndex - i;
+        if (candidateIndex < index) {
           // we can't use buckets less than our initial index
           continue;
         }
 
-        long candidateAddress = addressFromIndex(candidate % numBuckets);
+        long candidateAddress = addressFromIndex(candidateIndex);
         if (getIndex(unsafe.getLong(candidateAddress)) >= minBaseIndex) {
           // swap candidate vals to empty vals
           unsafe.putLong( // swap hashCode
@@ -201,17 +206,16 @@ public class ByteToLongHashTable {
           // empty out candidate
           unsafe.setMemory(candidateAddress, BUCKET_SIZE, (byte) 0);
 
-          emptyIndex = candidate;
+          emptyIndex = candidateIndex;
           foundSwap = true;
-          numSwaps++;
           break;
         }
       }
 
       if (!foundSwap) {
         // we were unable to find an open bucket to swap with, this is bad
-        throw new RuntimeException(String.format(
-            "No swap candidates in neighborhood, unable to move empty bucket"));
+        throw new RuntimeException(
+            "No swap candidates in neighborhood, unable to move empty bucket");
       }
     }
 
@@ -229,6 +233,7 @@ public class ByteToLongHashTable {
       try {
         drainStatus.lazySet(DrainStatus.PROCESSING);
         drainBuffer();
+        evict();
       } finally {
         drainStatus.compareAndSet(DrainStatus.PROCESSING, DrainStatus.IDLE);
         evictionLock.unlock();
@@ -253,9 +258,24 @@ public class ByteToLongHashTable {
   }
 
   @GuardedBy("evictionLock")
+  private void deleteBucket(long address) {
+    unsafe.setMemory(address, BUCKET_SIZE, (byte) 0);
+  }
+
+  @GuardedBy("evictionLock")
   private void evict() {
     while (hasOverflowed()) {
-
+      for (;;) {
+        long address = fifoHead.get();
+        long hashCode = unsafe.getLongVolatile(null, address);
+        if (unsafe.compareAndSwapLong(null, address, hashCode, EMPTY)) {
+          fifoHead.set(unsafe.getLong(address + BUCKET_POINTER_OFFSET));
+          deleteBucket(address);
+          numEntries.decrementAndGet();
+          evictions.incrementAndGet();
+          return;
+        }
+      }
     }
   }
 
@@ -277,6 +297,10 @@ public class ByteToLongHashTable {
         .putBytes(val)
         .hash()
         .asLong();
+  }
+
+  private double getLoadFactor() {
+    return ((double) Math.round(((double) numEntries.get() / (double) numBuckets) * 100)) / 100;
   }
 
   private long ceilingNextPowerOfTwo(long x) {
@@ -305,13 +329,18 @@ public class ByteToLongHashTable {
     @GuardedBy("evictionLock")
     public void run() {
       if (numEntries.getAndIncrement() == 0L) {
-        unsafe.putLongVolatile(null, address + BUCKET_POINTER_OFFSET, -1L);
+        // first entry into the hash table
         fifoHead.set(address);
         fifoTail.set(address);
       } else {
-        unsafe.putLongVolatile(null, address + BUCKET_POINTER_OFFSET, fifoTail.get());
+        // update the previous entry's pointer to  point to the new
+        // entry and update the tail pointer
+        unsafe.putLongVolatile(null, fifoTail.get() + BUCKET_POINTER_OFFSET, address);
         fifoTail.set(address);
       }
+
+      // set the newly added entry's pointer to NOT_FOUND
+      unsafe.putLongVolatile(null, address + BUCKET_POINTER_OFFSET, -1L);
     }
   }
 }

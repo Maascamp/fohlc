@@ -5,6 +5,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 @SuppressWarnings("all")
@@ -28,9 +29,11 @@ public class TestByteToLongHashTable {
       cache.put(("string" + i).getBytes(), i);
     }
 
-    assertTrue("Expected 10", cache.getSize() == 10);
-    assertTrue("Expected 3072 (128 * 24)", cache.getSizeInBytes() == 3072);
-    assertTrue("Expected 0.8 (10 / 128)", cache.getLoadFactor() == 0.08);
+    CacheMetrics metrics = cache.getCacheMetrics();
+    assertTrue("Expected 10", metrics.numEntries == 10);
+    assertTrue("Expected 128", metrics.numBuckets == 128);
+    assertTrue("Expected 3072 (128 * 24)", metrics.sizeInBytes == 3072);
+    assertTrue("Expected 0.8 (10 / 128)", metrics.loadFactor == 0.08);
   }
 
   @Test
@@ -43,5 +46,25 @@ public class TestByteToLongHashTable {
       long value = cache.get(String.format("string%d", i).getBytes());
       assertTrue(value == i);
     }
+  }
+
+  @Test
+  public void testGetAndPutIfEmpty() {
+    long existing = cache.getAndPutIfEmpty("test".getBytes(), 100L);
+    assertEquals(existing, ByteToLongHashTable.NOT_FOUND);
+
+    existing = cache.getAndPutIfEmpty("test".getBytes(), 200L);
+    assertEquals(existing, 100L);
+  }
+
+  @Test
+  public void testEvictions() {
+    CacheMetrics metrics = cache.getCacheMetrics();
+    for (int i=0; i < (metrics.numBuckets * 2); i++) {
+      cache.put(String.format("string%d", i).getBytes(), i);
+    }
+
+    metrics = cache.getCacheMetrics();
+    assertTrue(metrics.evictions > metrics.numBuckets);
   }
 }
