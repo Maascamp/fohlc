@@ -72,6 +72,7 @@ public class ByteToLongHashTable {
   private final AtomicLong fifoHead = new AtomicLong(-1L);
   private final AtomicLong fifoTail = new AtomicLong(-1L);
 
+  // TODO: add the option to have bookeeping done in a separate thread.
   public ByteToLongHashTable(long numEntries) {
     this.evictionLock = new ReentrantLock();
     this.taskBuffer = new ConcurrentLinkedQueue<>();
@@ -326,18 +327,22 @@ public class ByteToLongHashTable {
   }
 
   /**
-   * Returns the index into the allocated memory by performing the following steps:
-   * 1. Hash byte[] and mod it by getSize of memory
-   * 2. Align to nearest multiple of BUCKET_SIZE by modding and adding/substracting the remainder
+   * Maps a hash code into the bucket range.
    */
   private long getIndex(long hashCode) {
     return Math.abs(hashCode % numBuckets);
   }
 
+  /**
+   * Returns a pointer to the actual memory location referenced by the index.
+   */
   private long addressFromIndex(long index) {
     return (index * BUCKET_SIZE) + memStart;
   }
 
+  /**
+   * Generate a 64 bit hash code from the specified byte array.
+   */
   private long hash(byte[] val) {
     return hashFunction.newHasher(val.length)
         .putBytes(val)
@@ -345,6 +350,9 @@ public class ByteToLongHashTable {
         .asLong();
   }
 
+  /**
+   * Returns the load factor to 2 decimal places.
+   */
   private double getLoadFactor() {
     return ((double) Math.round(((double) numEntries.get() / (double) numBuckets) * 100)) / 100;
   }
@@ -363,6 +371,10 @@ public class ByteToLongHashTable {
     PROCESSING
   }
 
+  /**
+   * Runnable that performs the necessary bookkeeping after
+   * a write to the hash table.
+   */
   private class WriteTask implements Runnable {
 
     public final long address;
