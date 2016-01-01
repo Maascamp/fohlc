@@ -1,4 +1,4 @@
-package com.maascamp.folc;
+package com.maascamp.fohlc;
 
 
 import org.junit.After;
@@ -11,11 +11,15 @@ import static org.junit.Assert.assertTrue;
 @SuppressWarnings("all")
 public class TestByteToLongHashTable {
 
-  private ByteToLongHashTable cache;
+  private FifoOffHeapLongCache cache;
 
   @Before
   public void setUp() {
-    this.cache = new ByteToLongHashTable(100L);
+    //this.cache = new FifoOffHeapLongCache(100L);
+    this.cache = new FifoOffHeapLongCache.Builder()
+            .numEntries(100L)
+            .asyncBookkeeping(false)
+            .build();
   }
 
   @After
@@ -60,11 +64,39 @@ public class TestByteToLongHashTable {
   @Test
   public void testEvictions() {
     CacheMetrics metrics = cache.getCacheMetrics();
-    for (int i=0; i < (metrics.numBuckets * 2); i++) {
+    for (int i=1; i <= (metrics.numBuckets * 2); i++) {
       cache.put(String.format("string%d", i).getBytes(), i);
     }
 
     metrics = cache.getCacheMetrics();
     assertTrue(metrics.evictions > metrics.numBuckets);
+  }
+
+  @Test
+  public void testEvictionsAsync() throws InterruptedException {
+    this.cache.destroy();
+    this.cache = new FifoOffHeapLongCache.Builder()
+            .numEntries(100L)
+            .asyncBookkeeping(true)
+            .bookkeepingIntervalMillis(10L)
+            .build();
+
+    CacheMetrics metrics = cache.getCacheMetrics();
+    for (int i=1; i <= (metrics.numBuckets * 2); i++) {
+      cache.put(String.format("string%d", i).getBytes(), i);
+      Thread.sleep(1);
+    }
+
+    metrics = cache.getCacheMetrics();
+    assertTrue(metrics.evictions > metrics.numBuckets);
+  }
+
+  @Test
+  public void testGetOldest() {
+    for (int i=1; i <= 10; i++) {
+      cache.put(String.format("string%d", i).getBytes(), i);
+    }
+
+    assertEquals(1L, (long) cache.getOldestEntry());
   }
 }

@@ -1,4 +1,4 @@
-group 'com.maascamp.folc'
+group 'com.maascamp.fohlc'
 version '1.0-SNAPSHOT'
 
 apply plugin: 'java'

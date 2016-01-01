@@ -1,4 +1,4 @@
-package com.maascamp.folc;
+package com.maascamp.fohlc;
 
 import com.google.common.base.MoreObjects;
 
