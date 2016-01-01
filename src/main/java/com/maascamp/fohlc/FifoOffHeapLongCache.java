@@ -110,7 +110,6 @@ public class FifoOffHeapLongCache {
     }
   }
 
-  // TODO: add the option to have bookkeeping done in a separate thread.
   public FifoOffHeapLongCache(long numEntries, boolean asyncBookkeeping, long bookkeepingIntervalMillis) {
     this.evictionLock = new ReentrantLock();
     this.taskBuffer = new ConcurrentLinkedQueue<>();
@@ -458,6 +457,15 @@ public class FifoOffHeapLongCache {
     }
   }
 
+  /**
+   * Thread for performing async bookkeeping.
+   *
+   * Once started this thread performs the following in a loop until the cache
+   * is destroyed:
+   *   1. run any bookkeeping tasks on the {@link #taskQueue}
+   *   2. call {@link #evict()}
+   *   3. sleep for {@link #checkIntervalMillis}
+   */
   private class BookkeepingThread extends Thread {
 
     private final long checkIntervalMillis;

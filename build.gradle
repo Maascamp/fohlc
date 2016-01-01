@@ -21,9 +21,8 @@ dependencies {
 
 compileJava {
     options.compilerArgs << '-XDignore.symbol.file'
-    options.compilerArgs << "-Xlint:unchecked" << "-Xlint:deprecation"
-}
+    options.fork = true
+    options.forkOptions.executable = 'javac'
 
-compileTestJava {
-    options.compilerArgs << '-XDignore.symbol.file'
+    options.compilerArgs << "-Xlint:unchecked" << "-Xlint:deprecation"
 }
