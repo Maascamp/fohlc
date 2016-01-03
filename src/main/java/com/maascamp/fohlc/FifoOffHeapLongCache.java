@@ -5,6 +5,7 @@ import com.google.common.hash.Hashing;
 
 import sun.misc.Unsafe;
 
+import java.lang.reflect.Field;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
@@ -13,6 +14,26 @@ import java.util.concurrent.locks.ReentrantLock;
 
 import javax.annotation.concurrent.GuardedBy;
 
+/**
+ * A lightweight off-heap cache with FIFO eviction semantics.
+ *
+ * As its name suggests, FifoOffHeapLongCache only stores long values.
+ * THIS IS NOT A GENERAL PURPOSE Object CACHE. FifoOffHeapLongCache
+ * uses Hopscotch hashing (a form of linear probing) for collision
+ * resolution. Eviction begins when the load factor exceeds
+ * {@link #EVICTION_THRESHOLD}.
+ *
+ * There are two bookkeeping/eviction strategies, synchronous and asynchronous.
+ * Synchronous bookkeeping should be used with smaller cache sizes and is
+ * modeled on the design used for
+ * <a=href="https://github.com/ben-manes/concurrentlinkedhashmap/wiki/Design">
+ * ConcurrentLinkedHashMap</a>. It amortizes bookkeeping and eviction across
+ * threads. Asynchronous bookkeeping utilises a background thread and should
+ * only be used with large cache sizes. It aims to keep the load factor
+ * between 0.8 and 0.85.
+ *
+ * This cache explicitly does NOT offer delete/remove key functionality.
+ */
 public class FifoOffHeapLongCache {
 
   /**
@@ -57,8 +78,7 @@ public class FifoOffHeapLongCache {
    */
   private static final int PROBE_MAX = 8192;
 
-  // Bookkeeping properties for async bookkeeping.
-  // see https://github.com/ben-manes/concurrentlinkedhashmap/wiki/Design
+  // properties for async bookkeeping.
   private final Lock evictionLock;
   private final Queue<Runnable> taskBuffer;
   private static final int WRITE_BUFFER_DRAIN_THRESHOLD = 16;
@@ -110,13 +130,17 @@ public class FifoOffHeapLongCache {
     }
   }
 
-  public FifoOffHeapLongCache(long numEntries, boolean asyncBookkeeping, long bookkeepingIntervalMillis) {
+  public FifoOffHeapLongCache(
+          long numEntries,
+          boolean asyncBookkeeping,
+          long bookkeepingIntervalMillis
+  ) {
     this.evictionLock = new ReentrantLock();
     this.taskBuffer = new ConcurrentLinkedQueue<>();
     this.sizeInBytes = ceilingNextPowerOfTwo(numEntries) * BUCKET_SIZE;
     this.numBuckets = sizeInBytes / BUCKET_SIZE;
 
-    this.unsafe = UnsafeAccess.getUnsafe();
+    this.unsafe = getUnsafe();
     this.hashFunction = Hashing.murmur3_128(); // should we be using the seeded variant?
 
     this.memStart = this.unsafe.allocateMemory(this.sizeInBytes);
@@ -140,55 +164,6 @@ public class FifoOffHeapLongCache {
       }
     } catch (InterruptedException e) {} finally {
       unsafe.freeMemory(memStart);
-    }
-  }
-
-  /**
-   * Generate a CacheMetrics object representing the current state
-   * of the cache.
-   * @return {@link CacheMetrics}
-   */
-  public CacheMetrics getCacheMetrics() {
-    return new CacheMetrics(
-      sizeInBytes,
-      numBuckets,
-      numEntries.get(),
-      getLoadFactorPretty(),
-      hits.get(),
-      misses.get(),
-      evictions.get()
-    );
-  }
-
-  /**
-   * Associate the specified value with the specified key in the cache
-   * if the key does not currently exist in the cache.
-   *
-   * If the key already exists in the cache this method is a no-op.
-   */
-  public void put(byte[] key, long value) {
-    // if hash table already contains value do nothing
-    final Long val = _get(key);
-    if (val == null) {
-      _put(key, value);
-    }
-  }
-
-  /**
-   * Unconditionally associate the specified value with the specified key.
-   */
-  private void _put(byte[] key, long value) {
-    final long hashCode = hash(key);
-    long index = getIndex(hashCode);
-
-    // keep trying until we get a stable write
-    for (;;) {
-      long address = addressFromIndex(findAvailableBucket(index));
-      if (unsafe.compareAndSwapLong(null, address, EMPTY, hashCode)) {
-        unsafe.putLongVolatile(null, address + VALUE_OFFSET, value);
-        queueWrite(new WriteTask(address)); // queue the bookkeeping for async processing
-        return;
-      }
     }
   }
 
@@ -224,6 +199,55 @@ public class FifoOffHeapLongCache {
 
     hits.incrementAndGet();
     return val;
+  }
+
+  /**
+   * Associate the specified value with the specified key in the cache
+   * if the key does not currently exist in the cache.
+   *
+   * If the key already exists in the cache this method is a no-op.
+   */
+  public void put(byte[] key, long value) {
+    // if hash table already contains value do nothing
+    final Long val = _get(key);
+    if (val == null) {
+      _put(key, value);
+    }
+  }
+
+  /**
+   * Generate a CacheMetrics object representing the current state
+   * of the cache.
+   * @return {@link CacheMetrics}
+   */
+  public CacheMetrics getCacheMetrics() {
+    return new CacheMetrics(
+      sizeInBytes,
+      numBuckets,
+      numEntries.get(),
+      getLoadFactorPretty(),
+      hits.get(),
+      misses.get(),
+      evictions.get()
+    );
+  }
+
+  /**
+   * Unconditionally associate the specified value with the specified key.
+   */
+  private void _put(byte[] key, long value) {
+    final long hashCode = hash(key);
+    long index = getIndex(hashCode);
+
+    // keep trying until we get a stable write
+    for (;;) {
+      long address = addressFromIndex(findAvailableBucket(index));
+      if (unsafe.compareAndSwapLong(null, address, EMPTY, hashCode)) {
+        unsafe.putLongVolatile(null, address + VALUE_OFFSET, value);
+        queueWrite(new WriteTask(address)); // queue the bookkeeping for async processing
+        return;
+      }
+    }
   }
 
   /**
@@ -492,6 +516,24 @@ public class FifoOffHeapLongCache {
         }
       } catch (InterruptedException e) {} finally {
         evictionLock.unlock();
+      }
+    }
+  }
+
+  /**
+   * Returns the Unsafe singleton.
+   * @return sun.misc.Unsafe
+   */
+  private static Unsafe getUnsafe() {
+    try {
+      return Unsafe.getUnsafe();
+    } catch (SecurityException firstUse) {
+      try {
+        Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
+        theUnsafe.setAccessible(true);
+        return (Unsafe) theUnsafe.get(null);
+      } catch (Exception e) {
+        throw new RuntimeException("Unable to acquire Unsafe", e);
       }
     }
   }

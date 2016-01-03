@@ -15,7 +15,6 @@ public class TestByteToLongHashTable {
 
   @Before
   public void setUp() {
-    //this.cache = new FifoOffHeapLongCache(100L);
     this.cache = new FifoOffHeapLongCache.Builder()
             .numEntries(100L)
             .asyncBookkeeping(false)
@@ -62,6 +61,15 @@ public class TestByteToLongHashTable {
   }
 
   @Test
+  public void testGetOldest() {
+    for (int i=1; i <= 10; i++) {
+      cache.put(String.format("string%d", i).getBytes(), i);
+    }
+
+    assertEquals(1L, (long) cache.getOldestEntry());
+  }
+
+  @Test
   public void testEvictions() {
     CacheMetrics metrics = cache.getCacheMetrics();
     for (int i=1; i <= (metrics.numBuckets * 2); i++) {
@@ -89,14 +97,5 @@ public class TestByteToLongHashTable {
 
     metrics = cache.getCacheMetrics();
     assertTrue(metrics.evictions > metrics.numBuckets);
-  }
-
-  @Test
-  public void testGetOldest() {
-    for (int i=1; i <= 10; i++) {
-      cache.put(String.format("string%d", i).getBytes(), i);
-    }
-
-    assertEquals(1L, (long) cache.getOldestEntry());
   }
 }
