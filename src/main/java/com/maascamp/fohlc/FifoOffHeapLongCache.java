@@ -394,9 +394,10 @@ public class FifoOffHeapLongCache {
       do {
         for(;;) {
           long address = fifoHead.get();
-          long hashCode = unsafe.getLongVolatile(null, address);
+          long hashCode = unsafe.getLong(address);
+          long next = unsafe.getLong(address + POINTER_OFFSET);
           if (unsafe.compareAndSwapLong(null, address, hashCode, EMPTY)) {
-            fifoHead.set(unsafe.getLong(address + POINTER_OFFSET));
+            fifoHead.set(next);
             deleteBucket(address);
             numEntries.decrementAndGet();
             evictions.incrementAndGet();
