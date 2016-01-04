@@ -239,15 +239,10 @@ public class FifoOffHeapLongCache {
     final long hashCode = hash(key);
     long index = getIndex(hashCode);
 
-    // keep trying until we get a stable write
-    for (;;) {
-      long address = addressFromIndex(findAvailableBucket(index));
-      if (unsafe.compareAndSwapLong(null, address, EMPTY, hashCode)) {
-        unsafe.putLongVolatile(null, address + VALUE_OFFSET, value);
-        queueWrite(new WriteTask(address)); // queue the bookkeeping for async processing
-        return;
-      }
-    }
+    long address = addressFromIndex(findAvailableBucket(index));
+    unsafe.putLongVolatile(null, address, hashCode);
+    unsafe.putLongVolatile(null, address + VALUE_OFFSET, value);
+    queueWrite(new WriteTask(address)); // queue the bookkeeping for async processing
   }
 
   /**
@@ -283,18 +278,21 @@ public class FifoOffHeapLongCache {
     for (int i=0; i < NEIGHBORHOOD; i++) {
       long candidateIndex = (index + i) % numBuckets;
       long bucketHashCode = unsafe.getLongVolatile(null, addressFromIndex(candidateIndex));
-      if (bucketHashCode == EMPTY) {
+      if (bucketHashCode == EMPTY
+          && unsafe.compareAndSwapLong(null, addressFromIndex(candidateIndex), EMPTY, -2L)) {
         // we've found it so return the index
         return candidateIndex;
       }
     }
 
     // if we got here we were unable to find an empty bucket in the neighborhood
+    // so we start probing up to PROBE_MAX
     long emptyIndex = -1L;
     long probeStart = (index + NEIGHBORHOOD) % numBuckets;
     for (int i=0; i < PROBE_MAX; i += BUCKET_SIZE) {
       long bucketHashCode = unsafe.getLongVolatile(null, addressFromIndex((probeStart + i) % numBuckets));
-      if (bucketHashCode == EMPTY) {
+      if (bucketHashCode == EMPTY
+          && unsafe.compareAndSwapLong(null, addressFromIndex((probeStart + i) % numBuckets), EMPTY, -2L)) {
         emptyIndex = (probeStart + i) % numBuckets;
         break;
       }
@@ -319,7 +317,9 @@ public class FifoOffHeapLongCache {
 
         long candidateAddress = addressFromIndex(candidateIndex);
         if (getIndex(unsafe.getLong(candidateAddress)) >= minBaseIndex) {
-          // swap candidate vals to empty vals
+          // swap candidate values to empty values
+          // NOTE: there's no need to empty out the candidate
+          // bucket since we're directly overwriting anyway
           unsafe.putLong( // swap hashCode
               emptyAddress,
               unsafe.getLong(candidateAddress));
@@ -330,10 +330,8 @@ public class FifoOffHeapLongCache {
               emptyAddress + POINTER_OFFSET,
               unsafe.getLong(candidateAddress + POINTER_OFFSET));
 
-          // empty out candidate
-          unsafe.setMemory(candidateAddress, BUCKET_SIZE, (byte) 0);
-
           emptyIndex = candidateIndex;
+          emptyAddress = candidateAddress;
           foundSwap = true;
           break;
         }
@@ -341,6 +339,8 @@ public class FifoOffHeapLongCache {
 
       if (!foundSwap) {
         // we were unable to find an open bucket to swap with, this is bad
+        // so remove our changes and throw an exception
+        unsafe.setMemory(emptyAddress, BUCKET_SIZE, (byte) 0);
         throw new RuntimeException(
             "No swap candidates in neighborhood, unable to move empty bucket");
       }
