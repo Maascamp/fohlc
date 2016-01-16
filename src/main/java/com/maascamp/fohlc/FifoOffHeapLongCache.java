@@ -23,14 +23,10 @@ import javax.annotation.concurrent.GuardedBy;
  * resolution. Eviction begins when the load factor exceeds
  * {@link #EVICTION_THRESHOLD}.
  *
- * There are two bookkeeping/eviction strategies, synchronous and asynchronous.
- * Synchronous bookkeeping should be used with smaller cache sizes and is
- * modeled on the design used for
+ * The bookkeeping strategy is modeled on the design used for
  * <a=href="https://github.com/ben-manes/concurrentlinkedhashmap/wiki/Design">
  * ConcurrentLinkedHashMap</a>. It amortizes bookkeeping and eviction across
- * threads. Asynchronous bookkeeping utilises a background thread and should
- * only be used with large cache sizes. It aims to keep the load factor
- * between 0.8 and 0.85.
+ * threads. We aim to keep the load factor between 0.8 and 0.85.
  *
  * This cache explicitly does NOT offer delete/remove key functionality.
  */
@@ -75,6 +71,9 @@ public class FifoOffHeapLongCache {
    * Maximum number of probes for an empty bucket before we
    * declare failure. The chances of not finding an open slot
    * in {@link #NEIGHBORHOOD} probes is 1/{@link #NEIGHBORHOOD}! (factorial)
+   * for a single neighborhood. However chances are actually much higher
+   * since the above doesn't account for overlapping neighborhoods and so
+   * doesn't necessarily prevent clustering.
    */
   private static final int PROBE_MAX = 8192;
 
@@ -189,7 +188,8 @@ public class FifoOffHeapLongCache {
   }
 
   /**
-   * Unconditionally associate the specified value with the specified key.
+   * Associate the specified value with the specified key unless
+   * that key alredy exists in the hashtable.
    */
   private void _put(byte[] key, long value) {
     final long hashCode = hash(key);
@@ -208,19 +208,21 @@ public class FifoOffHeapLongCache {
   }
 
   /**
-   * Since we use hopscotch hashing, key is guaranteed to be within H steps of index.
+   * Since we use hopscotch hashing, key is guaranteed to be
+   * within {@link #NEIGHBORHOOD} steps of index.
    */
   private Long _get(byte[] key) {
     final long hashCode = hash(key);
     long index = getIndex(hashCode);
 
-    // we start at the bucket index then step forward up to (NEIGHBORHOOD - 1) times
+    // start at `index` then step forward up to (NEIGHBORHOOD - 1) times
     for (int i=0; i<NEIGHBORHOOD; i++) {
       long address = addressFromIndex((index + i) % numBuckets);
       if (unsafe.getLong(address) == -1L) {
-        i--; // someone is already doing stuff so spin
+        // someone is already doing stuff so spin
+        i--;
       } else if (unsafe.compareAndSwapLong(null, address, hashCode, -1L)) {
-        // we've found it so return the corresponding value
+        // we've found `hashCode` so return the corresponding value
         long val = unsafe.getLong(address + VALUE_OFFSET);
         if (!unsafe.compareAndSwapLong(null, address, -1L, hashCode)) {
           throw new RuntimeException("Concurrent modification of key: " + hashCode);
@@ -233,6 +235,13 @@ public class FifoOffHeapLongCache {
     return null;
   }
 
+  /**
+   * Finds, locks, and returns an empty bucket for the caller's use, performing
+   * any necessary swaps according to the Hopscotch algorithm.
+   *
+   * It is the responsibility of the caller to unlock the bucket when they're
+   * done with it.
+   */
   private long findAvailableBucket(long hashCode) {
     long index = getIndex(hashCode);
 
@@ -241,17 +250,19 @@ public class FifoOffHeapLongCache {
       long candidateAddress = addressFromIndex((index + i) % numBuckets);
       long current = unsafe.getLong(candidateAddress);
       if (current == -1L) {
-        i--; // someone is already doing stuff so spin
+        // someone is already doing stuff so spin
+        i--;
       } else if (current == hashCode) {
-        return -1L; // another thread already added this key
+        // another thread already added our key/has so return
+        return -1L;
       } else if (unsafe.compareAndSwapLong(null, candidateAddress, EMPTY, -1L)) {
         // we've found it so return the index
         return (index + i) % numBuckets;
       }
     }
 
-    // if we got here we were unable to find an empty bucket in the neighborhood
-    // so we start probing up to PROBE_MAX
+    // if we got here we were unable to find an empty bucket in
+    // the neighborhood so we start probing up to PROBE_MAX
     long emptyIndex = -1L;
     long emptyAddress = -1L;
     long probeStart = index + NEIGHBORHOOD;
@@ -259,9 +270,11 @@ public class FifoOffHeapLongCache {
       emptyAddress = addressFromIndex((probeStart + i) % numBuckets);
       long current = unsafe.getLong(emptyAddress);
       if (current == -1L) {
-        i--; // someone is already doing stuff so spin
+        // someone is already doing stuff so spin
+        i--;
       } else if (current == hashCode) {
-        return -1L; // another thread already added this key
+        // another thread already added our key/hash so return
+        return -1L;
       } else if (unsafe.compareAndSwapLong(null, emptyAddress, EMPTY, -1L)) {
         emptyIndex = probeStart + i;
         break;
@@ -277,7 +290,6 @@ public class FifoOffHeapLongCache {
     while (emptyIndex - index > NEIGHBORHOOD) {
       boolean foundSwap = false;
       long minBaseIndex = emptyIndex - (NEIGHBORHOOD - 1);
-
       for(int i = NEIGHBORHOOD - 1; i > 0; i--) {
         long candidateIndex = emptyIndex - i;
         if (candidateIndex < index) {
@@ -285,27 +297,26 @@ public class FifoOffHeapLongCache {
           continue;
         }
 
+        // we've got a candidate so lock (if still necessary) and do swap
         long candidateAddress = addressFromIndex(candidateIndex % numBuckets);
         long candidateHash = unsafe.getLong(candidateAddress);
         if (candidateHash == -1L) {
-          i++; // someone is already doing stuff so spin
+          // someone is already doing stuff so spin
+          i++;
         } else if (candidateHash == hashCode) {
-          if (!unsafe.compareAndSwapLong(null, emptyAddress, -1L, EMPTY)) { // reset value
+          // another thread already added our key/hash so reset and return
+          if (!unsafe.compareAndSwapLong(null, emptyAddress, -1L, EMPTY)) {
             throw new RuntimeException("Concurrent modification of key while swapping: " + hashCode);
           }
-          return -1L; // another thread already added this key
+          return -1L;
         } else if (getIndex(candidateHash) < minBaseIndex) {
-          continue; // can't swap to a index before minBaseIndex
+          // can't swap to a index before minBaseIndex
+          continue;
         } else if (unsafe.compareAndSwapLong(null, candidateAddress, candidateHash, -1L)) {
-          // swap values
-          long placeholder = unsafe.getLong(candidateAddress + VALUE_OFFSET);
-          unsafe.putLong(candidateAddress + VALUE_OFFSET, EMPTY);
-          unsafe.putLong(emptyAddress + VALUE_OFFSET, placeholder);
+          // do the swap
+          swapEntries(emptyAddress, candidateAddress);
 
-          // swap pointers
-          swapPointers(emptyAddress, candidateAddress);
-
-          placeholder = emptyAddress;
+          long placeholder = emptyAddress;
           emptyAddress = candidateAddress;
           candidateAddress = placeholder;
           emptyIndex = candidateIndex;
@@ -327,48 +338,74 @@ public class FifoOffHeapLongCache {
     return emptyIndex % numBuckets;
   }
 
-  private void swapPointers(long a, long b) {
-    long _b = unsafe.getLong(b + PREV_POINTER_OFFSET);
-    if (_b > 0L) {
+  /**
+   * Helper method for swapping two entries.
+   *
+   * NOTE: this method does not touch the hashes associated with the
+   * two entries because it is assumed they will be externally locked
+   * for the duration of this operation. It's up to the caller to
+   * lock/release each entry.
+   */
+  private void swapEntries(long a, long b) {
+    // swap `a`/`b` values
+    long placeholder = unsafe.getLong(b + VALUE_OFFSET);
+    unsafe.putLong(b + VALUE_OFFSET, EMPTY);
+    unsafe.putLong(a + VALUE_OFFSET, placeholder);
+
+    // update `b`'s predecessor to point to `a`
+    // and update `a` to point back to `b`'s predecessor
+    long predecessor = unsafe.getLong(b + PREV_POINTER_OFFSET);
+    if (predecessor > 0L) {
       for (;;) {
-        long hash = unsafe.getLong(_b);
+        long hash = unsafe.getLong(predecessor);
         if (hash == -1L) {
           continue;
-        } else if (unsafe.compareAndSwapLong(null, _b, hash, -1L)) {
-          unsafe.putLong(_b + NEXT_POINTER_OFFSET, a);
-          unsafe.compareAndSwapLong(null, _b, -1L, hash);
-          unsafe.putLong(a + PREV_POINTER_OFFSET, _b);
+        } else if (unsafe.compareAndSwapLong(null, predecessor, hash, -1L)) {
+          unsafe.putLong(predecessor + NEXT_POINTER_OFFSET, a);
+          unsafe.compareAndSwapLong(null, predecessor, -1L, hash);
+          unsafe.putLong(a + PREV_POINTER_OFFSET, predecessor);
           break;
         }
       }
     }
 
-    long b_ = unsafe.getLong(b + NEXT_POINTER_OFFSET);
-    if (b_ > 0L) {
+    // update `b`'s successor to point back to `a`
+    // and update `a` to point to `b`'s successor
+    long successor = unsafe.getLong(b + NEXT_POINTER_OFFSET);
+    if (successor > 0L) {
       for (;;) {
-        long hash = unsafe.getLong(b_);
+        long hash = unsafe.getLong(successor);
         if (hash == -1L) {
           continue;
-        } else if (unsafe.compareAndSwapLong(null, b_, hash, -1L)) {
-          unsafe.putLong(b_ + PREV_POINTER_OFFSET, a);
-          unsafe.putLong(a + NEXT_POINTER_OFFSET, b_);
-          unsafe.compareAndSwapLong(null, b_, -1L, hash);
+        } else if (unsafe.compareAndSwapLong(null, successor, hash, -1L)) {
+          unsafe.putLong(successor + PREV_POINTER_OFFSET, a);
+          unsafe.putLong(a + NEXT_POINTER_OFFSET, successor);
+          unsafe.compareAndSwapLong(null, successor, -1L, hash);
           break;
         }
       }
     }
 
-
+    // empty `b` and update fifo pointers if necessary
     unsafe.putLong(b + NEXT_POINTER_OFFSET, EMPTY);
     unsafe.putLong(b + PREV_POINTER_OFFSET, EMPTY);
     fifoHead.compareAndSet(b, a);
     fifoTail.compareAndSet(b, a);
   }
 
+  /**
+   * Adds a WriteTask to the queue for later processing.
+   */
   private void queueWrite(WriteTask task) {
     taskBuffer.add(task);
   }
 
+  /**
+   * Drains the {@link #taskBuffer} and performs any necessary
+   * eviction iff the {@link #evictionLock} is available.
+   *
+   * This method will NOT block when attempting to acquire the lock.
+   */
   private void maybeEvict() {
     if (evictionLock.tryLock()) {
       try {
@@ -382,6 +419,9 @@ public class FifoOffHeapLongCache {
     }
   }
 
+  /**
+   * Drains up to {@link #WRITE_BUFFER_DRAIN_THRESHOLD} WriteTasks.
+   */
   @GuardedBy("evictionLock")
   private void drainBuffer() {
     for (int i = 0; i < WRITE_BUFFER_DRAIN_THRESHOLD; i++) {
@@ -393,24 +433,38 @@ public class FifoOffHeapLongCache {
     }
   }
 
+  /**
+   * Whether or not we've exceeded the {@link #EVICTION_THRESHOLD}.
+   *
+   * @return true if we have and false otherwise.
+   */
   @GuardedBy("evictionLock")
   private boolean hasOverflowed() {
     return getLoadFactor() > EVICTION_THRESHOLD;
   }
 
+  /**
+   * Evicts the oldest entry in the hashtable and updates
+   * the list pointers.
+   */
   @GuardedBy("evictionLock")
   private void evict() {
     for (;;) {
-      long address = fifoHead.get(); // get oldest entry
+      // get oldest entry
+      long address = fifoHead.get();
       long hashCode = unsafe.getLong(address);
       if (hashCode == -1L) {
-        continue; // spin
+        // bucket is locked so spin
+        continue;
       } else if (unsafe.compareAndSwapLong(null, fifoHead.get(), hashCode, -1L)) {
         for (;;) {
+          // we must also lock the next entry in the list so
+          // we can do bookkeeping without risk of it being swapped
+          // from under us
           long next = unsafe.getLong(address + NEXT_POINTER_OFFSET);
           long nextHash = unsafe.getLong(next);
           if (nextHash == -1L) {
-            continue; // spin
+            continue;
           } else if (unsafe.compareAndSwapLong(null, next, nextHash, -1L)) {
             unsafe.putLong(next + PREV_POINTER_OFFSET, -1L);
             fifoHead.set(next);
@@ -423,7 +477,7 @@ public class FifoOffHeapLongCache {
           }
         }
 
-        // delete entry
+        // we've updated the books so delete the entry
         unsafe.putLong(address + VALUE_OFFSET, EMPTY);
         unsafe.putLong(address + NEXT_POINTER_OFFSET, EMPTY);
         unsafe.putLong(address + PREV_POINTER_OFFSET, EMPTY);
@@ -473,18 +527,21 @@ public class FifoOffHeapLongCache {
     return (double) numEntries.get() / (double) numBuckets;
   }
 
+  /**
+   * Helper method to return the next power of 2 >= the value passed in.
+   */
   private long ceilingNextPowerOfTwo(long x) {
     // From Hacker's Delight, Chapter 3, Harry S. Warren Jr.
     return 1 << (Long.SIZE - Long.numberOfLeadingZeros(x - 1));
   }
 
   /**
-   * Runnable that performs the necessary bookkeeping after
-   * a write to the hash table.
+   * Runnable that performs the necessary pointer
+   * bookkeeping after a write to the hash table.
    */
   private class WriteTask implements Runnable {
 
-    public final long newAddress;
+    private final long newAddress;
 
     public WriteTask(long newAddress) {
       this.newAddress = newAddress;
@@ -494,29 +551,32 @@ public class FifoOffHeapLongCache {
     @GuardedBy("evictionLock")
     public void run() {
       if (numEntries.getAndIncrement() == 0L) {
-        // first entry into the hash table
+        /* first entry into the hash table */
+        // no need to worry about locking since we
+        // can't be swapping entries at this point
         unsafe.putLong(newAddress + NEXT_POINTER_OFFSET, -1L);
         unsafe.putLong(newAddress + PREV_POINTER_OFFSET, -1L);
         fifoHead.set(newAddress);
         fifoTail.set(newAddress);
       } else {
+        // lock the tail entry so no swaps happen while bookkeeping
         for (;;) {
           long currentAddress = fifoTail.get();
           long currentHash = unsafe.getLong(currentAddress);
           if (currentHash == -1L) {
-            continue;
+            continue; // spin until bucket is available
           } else if (unsafe.compareAndSwapLong(null, fifoTail.get(), currentHash, -1L)) {
-            // update the previous entry's pointer to  point to the new
-            // entry and update the tail pointer
+            // update the previous entry's pointer to point to the new
             if (!unsafe.compareAndSwapLong(null, currentAddress + NEXT_POINTER_OFFSET, -1L, newAddress)) {
-              throw new RuntimeException("updating a tail that is not tail !");
+              throw new RuntimeException("updating a tail that is not tail !!!");
             }
 
+            // set the previous and next pointers on the new entry
             unsafe.putLong(newAddress + NEXT_POINTER_OFFSET, -1L);
             unsafe.putLong(newAddress + PREV_POINTER_OFFSET, currentAddress);
             fifoTail.set(newAddress);
             if (!unsafe.compareAndSwapLong(null, currentAddress, -1L, currentHash)) {
-              throw new RuntimeException("Concurrent modification during write bookkeeping !");
+              throw new RuntimeException("Concurrent modification during write bookkeeping !!!");
             }
             break;
           }
