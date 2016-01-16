@@ -34,7 +34,7 @@ public class FifoOffHeapLongCache {
 
   /**
    * Buckets are 32 bytes wide.
-   * 64 bit key + 64 bit value + 2 64 bit pointer to next bucket.
+   * 8 byte key + 8 byte value + two 8 byte pointers to the next/prev buckets.
    */
   private static final int BUCKET_SIZE = 32;
 
