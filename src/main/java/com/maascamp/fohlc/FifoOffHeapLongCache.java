@@ -13,6 +13,7 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
 import javax.annotation.concurrent.GuardedBy;
+import javax.annotation.concurrent.ThreadSafe;
 
 /**
  * A lightweight off-heap cache with FIFO eviction semantics.
@@ -597,11 +598,21 @@ public class FifoOffHeapLongCache {
     }
   }
 
+  @ThreadSafe
   public static interface EvictionListener {
 
+    /**
+     * Called once for each evicted entry.
+     *
+     * Implementations should be thread-safe as this method may be called
+     * by any thread writing to the cache.
+     */
     public void onEvict(long key, long value);
   }
 
+  /**
+   * Default no-op {@link com.maascamp.fohlc.FifoOffHeapLongCache.EvictionListener} implementation.
+   */
   private static class NoopEvictionListener implements EvictionListener {
     @Override
     public void onEvict(long key, long value) {
