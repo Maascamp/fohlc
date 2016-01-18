@@ -93,8 +93,12 @@ public class FifoOffHeapLongCache {
   private final AtomicLong evictions = new AtomicLong(0L);
   private final AtomicLong fifoHead = new AtomicLong(-1L);
   private final AtomicLong fifoTail = new AtomicLong(-1L);
+  private final EvictionListener evictionListener;
 
-  public FifoOffHeapLongCache(long numEntries) {
+  public FifoOffHeapLongCache(long numEntries, EvictionListener evictionListener) {
+    this.evictionListener = (evictionListener != null)
+                            ? evictionListener
+                            : new NoopEvictionListener();
     this.evictionLock = new ReentrantLock();
     this.taskBuffer = new ConcurrentLinkedQueue<>();
     this.sizeInBytes = ceilingNextPowerOfTwo(numEntries) * BUCKET_SIZE;
@@ -106,6 +110,10 @@ public class FifoOffHeapLongCache {
 
     this.memStart = this.unsafe.allocateMemory(this.sizeInBytes);
     this.unsafe.setMemory(this.memStart, this.sizeInBytes, (byte) 0); // zero out memory
+  }
+
+  public FifoOffHeapLongCache(long numEntries) {
+    this(numEntries, null);
   }
 
   /**
@@ -249,15 +257,18 @@ public class FifoOffHeapLongCache {
     for (int i=0; i < NEIGHBORHOOD; i++) {
       long candidateAddress = addressFromIndex((index + i) % numBuckets);
       long current = unsafe.getLong(candidateAddress);
+      if (unsafe.compareAndSwapLong(null, candidateAddress, EMPTY, -1L)) {
+        // we've found it so return the index
+        return (index + i) % numBuckets;
+      }
+
+      current = unsafe.getLong(candidateAddress);
       if (current == -1L) {
         // someone is already doing stuff so spin
         i--;
       } else if (current == hashCode) {
         // another thread already added our key/has so return
         return -1L;
-      } else if (unsafe.compareAndSwapLong(null, candidateAddress, EMPTY, -1L)) {
-        // we've found it so return the index
-        return (index + i) % numBuckets;
       }
     }
 
@@ -477,7 +488,8 @@ public class FifoOffHeapLongCache {
           }
         }
 
-        // we've updated the books so delete the entry
+        // we've updated the books so notify the listener and delete the entry
+        evictionListener.onEvict(hashCode, unsafe.getLong(address + VALUE_OFFSET));
         unsafe.putLong(address + VALUE_OFFSET, EMPTY);
         unsafe.putLong(address + NEXT_POINTER_OFFSET, EMPTY);
         unsafe.putLong(address + PREV_POINTER_OFFSET, EMPTY);
@@ -582,6 +594,18 @@ public class FifoOffHeapLongCache {
           }
         }
       }
+    }
+  }
+
+  public static interface EvictionListener {
+
+    public void onEvict(long key, long value);
+  }
+
+  private static class NoopEvictionListener implements EvictionListener {
+    @Override
+    public void onEvict(long key, long value) {
+      return;
     }
   }
 

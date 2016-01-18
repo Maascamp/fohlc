@@ -7,6 +7,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -86,9 +87,15 @@ public class TestByteToLongHashTable {
   }
 
   @Test
-  public void testConcurrentEvictions() throws InterruptedException {
+  public void testFifoConcurrentEvictions() throws InterruptedException {
+    final ArrayList<Long> evictions = new ArrayList();
     this.cache.destroy();
-    this.cache = new FifoOffHeapLongCache(1000L);
+    this.cache = new FifoOffHeapLongCache(1000L, new FifoOffHeapLongCache.EvictionListener() {
+      @Override
+      public void onEvict(long key, long value) {
+        evictions.add(value);
+      }
+    });
 
     CacheMetrics metrics = cache.getCacheMetrics();
     final long numBuckets = metrics.numBuckets;
@@ -96,13 +103,11 @@ public class TestByteToLongHashTable {
     final AtomicLong id = new AtomicLong(0);
     for (int i=0; i<3; i++) {
       threads.add(new Thread(() -> {
-        long count = 0;
         long start = System.nanoTime();
         try {
           for (int j = 1; j <= numBuckets; j++) {
-            String key = String.format("string-%d-%d", id.getAndIncrement(), j);
+            String key = String.format("string-%d", j);
             cache.put(key.getBytes(), j);
-            count++;
           }
         } catch (Exception e) {
           e.printStackTrace();
@@ -119,6 +124,8 @@ public class TestByteToLongHashTable {
     });
 
     metrics = cache.getCacheMetrics();
-    assertTrue(metrics.evictions > metrics.numBuckets);
+    for (int i = 0; i < metrics.evictions; i++) {
+      assertEquals((long) evictions.get(i), i+1);
+    }
   }
 }
