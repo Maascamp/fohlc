@@ -6,6 +6,7 @@ import com.google.common.hash.Hashing;
 import sun.misc.Unsafe;
 
 import java.lang.reflect.Field;
+import java.util.ConcurrentModificationException;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
@@ -202,18 +203,24 @@ public class FifoOffHeapLongCache {
    */
   private void _put(byte[] key, long value) {
     final long hashCode = hash(key);
-    long idx = findAvailableBucket(hashCode);
-    if (idx < 0) {
-      return; // we found our hashCode after all
-    }
+    //if (!test.containsKey(hashCode)) {
+    //  if (test.putIfAbsent(hashCode, true) != null) {
+    //    return;
+    //  }
+      long idx = findAvailableBucket(hashCode);
+      if (idx < 0) {
+        return; // we found our hashCode after all
+      }
 
-    long address = addressFromIndex(idx);
-    unsafe.putLong(address + VALUE_OFFSET, value);
-    queueWrite(new WriteTask(address));
-    if (!unsafe.compareAndSwapLong(null, address, -1L, hashCode)) {
-      throw new RuntimeException("Concurrent modification of key: " + hashCode);
-    }
-    maybeEvict();
+      long address = addressFromIndex(idx);
+      unsafe.putLong(address + VALUE_OFFSET, value);
+      queueWrite(new WriteTask(address));
+      if (!unsafe.compareAndSwapLong(null, address, -1L, hashCode)) {
+        throw new ConcurrentModificationException("Concurrent modification of key: " + hashCode);
+      }
+      //test.remove(hashCode);
+      maybeEvict();
+    //}
   }
 
   /**
@@ -234,7 +241,7 @@ public class FifoOffHeapLongCache {
         // we've found `hashCode` so return the corresponding value
         long val = unsafe.getLong(address + VALUE_OFFSET);
         if (!unsafe.compareAndSwapLong(null, address, -1L, hashCode)) {
-          throw new RuntimeException("Concurrent modification of key: " + hashCode);
+          throw new ConcurrentModificationException("Concurrent modification of key: " + hashCode);
         }
         return val;
       }
@@ -252,102 +259,136 @@ public class FifoOffHeapLongCache {
    * done with it.
    */
   private long findAvailableBucket(long hashCode) {
-    long index = getIndex(hashCode);
-
-    // see if we find a free bucket in the neighborhood
-    for (int i=0; i < NEIGHBORHOOD; i++) {
-      long candidateAddress = addressFromIndex((index + i) % numBuckets);
-      long current = unsafe.getLong(candidateAddress);
-      if (unsafe.compareAndSwapLong(null, candidateAddress, EMPTY, -1L)) {
-        // we've found it so return the index
-        return (index + i) % numBuckets;
-      }
-
-      current = unsafe.getLong(candidateAddress);
-      if (current == -1L) {
-        // someone is already doing stuff so spin
-        i--;
-      } else if (current == hashCode) {
-        // another thread already added our key/has so return
+    long baseIndex = getIndex(hashCode);
+    long baseAddress = addressFromIndex(baseIndex);
+    for(;;) {
+      long baseHash = unsafe.getLong(baseAddress);
+      if (baseHash == EMPTY && unsafe.compareAndSwapLong(null, baseAddress, EMPTY, -1L)) {
+        // no collision so return baseIndex
+        return baseIndex % numBuckets;
+      } else if (baseHash == hashCode) {
+        // our hash code already exists so return
         return -1L;
-      }
-    }
+      } else if (baseHash == -1L) {
+        // this bucket range is in use so wait till it's not
+        continue;
+      } else if (unsafe.compareAndSwapLong(null, baseAddress, baseHash, -1L)) {
+        // everything below is wrapped in a try finally so we're
+        // guaranteed to unlock the range when we're through with it
+        try {
+          boolean foundEmpty = false;
+          long emptyIndex = -1L;
+          long emptyAddress = -1L;
+          for (int i = 1; i < probeMax; i++) {
+            long candidateAddress = addressFromIndex((baseIndex + i) % numBuckets);
+            if (foundEmpty) {
+              // if we find an empty bucket within the neighborhood we keep
+              // searching till we reach the end of the neighborhood to
+              // ensure another thread didn't add the key at a later index
+              if (i >= NEIGHBORHOOD) {
+                // we found an empty bucket and our hash code does
+                // not already exist in the neighborhood so return it
+                return emptyIndex % numBuckets;
+              }
 
-    // if we got here we were unable to find an empty bucket in
-    // the neighborhood so we start probing up to PROBE_MAX
-    long emptyIndex = -1L;
-    long emptyAddress = -1L;
-    long probeStart = index + NEIGHBORHOOD;
-    for (int i=0; i < (probeMax - NEIGHBORHOOD); i++) {
-      emptyAddress = addressFromIndex((probeStart + i) % numBuckets);
-      long current = unsafe.getLong(emptyAddress);
-      if (current == -1L) {
-        // someone is already doing stuff so spin
-        i--;
-      } else if (current == hashCode) {
-        // another thread already added our key/hash so return
-        return -1L;
-      } else if (unsafe.compareAndSwapLong(null, emptyAddress, EMPTY, -1L)) {
-        emptyIndex = probeStart + i;
-        break;
-      }
-    }
+              long candidateHash = unsafe.getLong(null, candidateAddress);
+              if (candidateHash == -1L) {
+                // spin
+                i--;
+              } else if (candidateHash == hashCode) {
+                // another thread added our hash code so unlock and return
+                if (!unsafe.compareAndSwapLong(null, emptyAddress, -1L, EMPTY)) {
+                  throw new ConcurrentModificationException(
+                      "Concurrent modification of while range loced");
+                }
+                return -1L;
+              }
+            } else {
+              if (unsafe.compareAndSwapLong(null, candidateAddress, EMPTY, -1L)) {
+                // we found an empty bucket so note it then finish
+                // checking the neighborhood
+                emptyIndex = (baseIndex + i) % numBuckets;
+                emptyAddress = candidateAddress;
+                foundEmpty = true;
+                continue;
+              }
 
-    if (emptyIndex < 0) {
-      throw new RuntimeException(String.format(
-          "Unable to find a empty bucket after examining %d buckets", probeMax));
-    }
-
-    // now we swap back until the empty bucket is in the neighborhood
-    while (emptyIndex - index > NEIGHBORHOOD) {
-      boolean foundSwap = false;
-      long minBaseIndex = emptyIndex - (NEIGHBORHOOD - 1);
-      for(int i = NEIGHBORHOOD - 1; i > 0; i--) {
-        long candidateIndex = emptyIndex - i;
-        if (candidateIndex < index) {
-          // we can't use buckets less than our initial index
-          continue;
-        }
-
-        // we've got a candidate so lock (if still necessary) and do swap
-        long candidateAddress = addressFromIndex(candidateIndex % numBuckets);
-        long candidateHash = unsafe.getLong(candidateAddress);
-        if (candidateHash == -1L) {
-          // someone is already doing stuff so spin
-          i++;
-        } else if (candidateHash == hashCode) {
-          // another thread already added our key/hash so reset and return
-          if (!unsafe.compareAndSwapLong(null, emptyAddress, -1L, EMPTY)) {
-            throw new RuntimeException("Concurrent modification of key while swapping: " + hashCode);
+              long candidateHash = unsafe.getLong(null, candidateAddress);
+              if (candidateHash == -1L) {
+                // spin
+                i--;
+              } else if (candidateHash == hashCode) {
+                // hash code was added so return (no need to unlock here)
+                return -1L;
+              }
+            }
           }
-          return -1L;
-        } else if (getIndex(candidateHash) < minBaseIndex) {
-          // can't swap to a index before minBaseIndex
-          continue;
-        } else if (unsafe.compareAndSwapLong(null, candidateAddress, candidateHash, -1L)) {
-          // do the swap
-          swapEntries(emptyAddress, candidateAddress);
 
-          long placeholder = emptyAddress;
-          emptyAddress = candidateAddress;
-          candidateAddress = placeholder;
-          emptyIndex = candidateIndex;
-          foundSwap = true;
-          if (!unsafe.compareAndSwapLong(null, candidateAddress, -1L, candidateHash)) {
-            throw new RuntimeException("Concurrent modification of key while swapping: " + hashCode);
+          if (emptyIndex < 0) {
+            throw new RuntimeException(String.format(
+                "Unable to find a empty bucket after examining %d buckets", probeMax));
           }
-          break;
+
+          // now we swap back until the empty bucket is in the neighborhood
+          while (emptyIndex - baseIndex > NEIGHBORHOOD) {
+            boolean foundSwap = false;
+            long minBaseIndex = emptyIndex - (NEIGHBORHOOD - 1);
+            for (int i = NEIGHBORHOOD - 1; i > 0; i--) {
+              long candidateIndex = emptyIndex - i;
+              if (candidateIndex < baseIndex) {
+                // we can't use buckets less than our initial index
+                continue;
+              }
+
+              // we've got a candidate so lock (if still necessary) and do swap
+              long candidateAddress = addressFromIndex(candidateIndex % numBuckets);
+              long candidateHash = unsafe.getLong(candidateAddress);
+              if (candidateHash == -1L) {
+                // someone is already doing stuff so spin
+                i++;
+              } else if (candidateHash == hashCode) {
+                // another thread already added our hash code so unlock and return
+                if (!unsafe.compareAndSwapLong(null, emptyAddress, -1L, EMPTY)) {
+                  throw new ConcurrentModificationException(
+                      "Concurrent modification of key while swapping: " + hashCode);
+                }
+                return -1L;
+              } else if (getIndex(candidateHash) < minBaseIndex) {
+                // can't swap to a index before minBaseIndex
+                continue;
+              } else if (unsafe.compareAndSwapLong(null, candidateAddress, candidateHash, -1L)) {
+                // got a lock on the candidate so do the swap
+                swapEntries(emptyAddress, candidateAddress);
+
+                long placeholder = emptyAddress;
+                emptyAddress = candidateAddress;
+                candidateAddress = placeholder;
+                emptyIndex = candidateIndex;
+                foundSwap = true;
+                if (!unsafe.compareAndSwapLong(null, candidateAddress, -1L, candidateHash)) {
+                  throw new ConcurrentModificationException(
+                      "Concurrent modification of key during swap !!!");
+                }
+                break;
+              }
+            }
+
+            if (!foundSwap) {
+              // we were unable to find an open bucket to swap with, this is bad
+              throw new RuntimeException(
+                  "No swap candidates in neighborhood, unable to move empty bucket");
+            }
+          }
+
+          return emptyIndex % numBuckets;
+        } finally {
+          if (!unsafe.compareAndSwapLong(null, baseAddress, -1L, baseHash)) {
+            throw new ConcurrentModificationException(
+                "Concurrent modification of locked range !!!");
+          }
         }
       }
-
-      if (!foundSwap) {
-        // we were unable to find an open bucket to swap with, this is bad
-        throw new RuntimeException(
-            "No swap candidates in neighborhood, unable to move empty bucket");
-      }
     }
-
-    return emptyIndex % numBuckets;
   }
 
   /**
@@ -483,7 +524,7 @@ public class FifoOffHeapLongCache {
             numEntries.decrementAndGet();
             evictions.incrementAndGet();
             if (!unsafe.compareAndSwapLong(null, next, -1L, nextHash)) {
-              throw new RuntimeException("Concurrent modification of key during eviction !");
+              throw new ConcurrentModificationException("Concurrent modification of key during eviction !!!");
             }
             break;
           }
@@ -495,7 +536,7 @@ public class FifoOffHeapLongCache {
         unsafe.putLong(address + NEXT_POINTER_OFFSET, EMPTY);
         unsafe.putLong(address + PREV_POINTER_OFFSET, EMPTY);
         if (!unsafe.compareAndSwapLong(null, address, -1L, EMPTY)) {
-          throw new RuntimeException("Concurrent modification of key during delete !");
+          throw new ConcurrentModificationException("Concurrent modification of key during delete !!!");
         }
         break;
       }
@@ -589,7 +630,7 @@ public class FifoOffHeapLongCache {
             unsafe.putLong(newAddress + PREV_POINTER_OFFSET, currentAddress);
             fifoTail.set(newAddress);
             if (!unsafe.compareAndSwapLong(null, currentAddress, -1L, currentHash)) {
-              throw new RuntimeException("Concurrent modification during write bookkeeping !!!");
+              throw new ConcurrentModificationException("Concurrent modification during write bookkeeping !!!");
             }
             break;
           }

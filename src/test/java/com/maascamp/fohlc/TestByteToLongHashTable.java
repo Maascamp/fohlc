@@ -12,6 +12,8 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.Assert.assertEquals;
@@ -88,12 +90,21 @@ public class TestByteToLongHashTable {
 
   @Test
   public void testFifoConcurrentEvictions() throws InterruptedException {
-    final ArrayList<Long> evictions = new ArrayList();
+
+    AtomicInteger evictionCount = new AtomicInteger(0);
+    AtomicBoolean monotonicallyIncreasingEvictions = new AtomicBoolean(true);
+
     this.cache.destroy();
     this.cache = new FifoOffHeapLongCache(1000L, new FifoOffHeapLongCache.EvictionListener() {
+
+      private final AtomicLong expected = new AtomicLong(0);
+
       @Override
       public void onEvict(long key, long value) {
-        evictions.add(value);
+        if (evictionCount.incrementAndGet() < 800
+            && expected.incrementAndGet() != value) {
+          monotonicallyIncreasingEvictions.set(false);
+        }
       }
     });
 
@@ -101,7 +112,7 @@ public class TestByteToLongHashTable {
     final long numBuckets = metrics.numBuckets;
     List<Thread> threads = Lists.newArrayList();
     final AtomicLong id = new AtomicLong(0);
-    for (int i=0; i<3; i++) {
+    for (int i=0; i<8; i++) {
       threads.add(new Thread(() -> {
         long start = System.nanoTime();
         try {
@@ -123,9 +134,8 @@ public class TestByteToLongHashTable {
       } catch (InterruptedException e) {}
     });
 
-    metrics = cache.getCacheMetrics();
-    for (int i = 0; i < metrics.evictions; i++) {
-      assertEquals((long) evictions.get(i), i+1);
-    }
+    // we check to ensure that the first (size * eviction threshold)
+    // entries evicted are monotonically increasing
+    assertTrue(monotonicallyIncreasingEvictions.get());
   }
 }
