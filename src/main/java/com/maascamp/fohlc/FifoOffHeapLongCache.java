@@ -203,24 +203,19 @@ public class FifoOffHeapLongCache {
    */
   private void _put(byte[] key, long value) {
     final long hashCode = hash(key);
-    //if (!test.containsKey(hashCode)) {
-    //  if (test.putIfAbsent(hashCode, true) != null) {
-    //    return;
-    //  }
-      long idx = findAvailableBucket(hashCode);
-      if (idx < 0) {
-        return; // we found our hashCode after all
-      }
 
-      long address = addressFromIndex(idx);
-      unsafe.putLong(address + VALUE_OFFSET, value);
-      queueWrite(new WriteTask(address));
-      if (!unsafe.compareAndSwapLong(null, address, -1L, hashCode)) {
-        throw new ConcurrentModificationException("Concurrent modification of key: " + hashCode);
-      }
-      //test.remove(hashCode);
-      maybeEvict();
-    //}
+    long idx = findAvailableBucket(hashCode);
+    if (idx < 0) {
+      return; // we found our hashCode after all
+    }
+
+    long address = addressFromIndex(idx);
+    unsafe.putLong(address + VALUE_OFFSET, value);
+    queueWrite(new WriteTask(address));
+    if (!unsafe.compareAndSwapLong(null, address, -1L, hashCode)) {
+      throw new ConcurrentModificationException("Concurrent modification of key: " + hashCode);
+    }
+    maybeEvict();
   }
 
   /**
