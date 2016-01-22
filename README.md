@@ -16,4 +16,19 @@ Puts into FifoOffHeapLongCache are only written if the key does not currently ex
 Note that FifoOffHeapLongCache explicitly does NOT offer delete/remove key functionality.
 
 FifoOffHeapLongCache was built for large (>10GB) caches and stores all key, value, and pointer data 
-off-heap in pre-allocated memory in order to minimize GC overhead.
+off-heap in pre-allocated memory in order to minimize GC overhead. *NOTE: you __must__ call `destroy`
+on the cache or use it in a try-with-resources block (in which case `destroy` will be called for you)
+or any allocated memory will not be released.*
+
+####Usage
+```java
+try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
+  .setSize(100000000L)
+  .build()
+) {
+  String key = "key";
+  long value = 1L;
+  cache.put(key.getBytes(), value);
+  assert 1 == cache.get(key.getBytes());
+}
+```
