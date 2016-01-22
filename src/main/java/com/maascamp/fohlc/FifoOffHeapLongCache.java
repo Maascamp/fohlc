@@ -32,7 +32,34 @@ import javax.annotation.concurrent.ThreadSafe;
  *
  * This cache explicitly does NOT offer delete/remove key functionality.
  */
-public class FifoOffHeapLongCache {
+public class FifoOffHeapLongCache implements AutoCloseable {
+
+  /**
+   * Load factor threshold beyond which eviction begins.
+   */
+  static final double DEFAULT_EVICTION_THRESHOLD = 0.80;
+
+  /**
+   * Neighborhood for linear probing.
+   * See <a href="https://en.wikipedia.org/wiki/Hopscotch_hashing">
+   * Hopscotch Hashing</a>
+   */
+  static final int DEFAULT_NEIGHBORHOOD_SIZE = 256;
+
+  /**
+   * Maximum number of probes for an empty bucket before we
+   * declare failure. The chances of not finding an open slot
+   * in {@link #NEIGHBORHOOD} probes is 1/{@link #NEIGHBORHOOD}! (factorial)
+   * for a single neighborhood. However chances are actually much higher
+   * since the above doesn't account for overlapping neighborhoods and so
+   * doesn't necessarily prevent clustering.
+   */
+  static final int DEFAULT_PROBE_MAX = 8192;
+
+  /**
+   * Maximum number of tasks to process per call to {@link #drainBuffer()}.
+   */
+  static final int DEFAULT_DRAIN_THRESHOLD = 512;
 
   /**
    * Buckets are 32 bytes wide.
@@ -56,56 +83,41 @@ public class FifoOffHeapLongCache {
   private static final int PREV_POINTER_OFFSET = 24;
 
   /**
-   * Load factor threshold beyond which eviction begins.
+   * Empty bucket value.
    */
-  private static final double EVICTION_THRESHOLD = 0.80;
-
   private static final long EMPTY = 0L;
-
-  /**
-   * Neighborhood for linear probing.
-   * See <a href="https://en.wikipedia.org/wiki/Hopscotch_hashing">
-   * Hopscotch Hashing</a>
-   */
-  private static final int NEIGHBORHOOD = 256;
-
-  /**
-   * Maximum number of probes for an empty bucket before we
-   * declare failure. The chances of not finding an open slot
-   * in {@link #NEIGHBORHOOD} probes is 1/{@link #NEIGHBORHOOD}! (factorial)
-   * for a single neighborhood. However chances are actually much higher
-   * since the above doesn't account for overlapping neighborhoods and so
-   * doesn't necessarily prevent clustering.
-   */
-  private static final int PROBE_MAX = 8192;
 
   private final Lock evictionLock;
   private final Queue<WriteTask> taskBuffer;
-  private static final int WRITE_BUFFER_DRAIN_THRESHOLD = 512;
 
   private final long probeMax;
   private final long sizeInBytes;
   private final long numBuckets;
   private final long memStart;
+  private final int neighborhoodSize;
+  private final int drainThreshold;
+  private final double evictionThreshold;
   private final Unsafe unsafe;
   private final HashFunction hashFunction;
+  private final EvictionListener evictionListener;
+
   private final AtomicLong numEntries = new AtomicLong(0L);
   private final AtomicLong hits = new AtomicLong(0L);
   private final AtomicLong misses = new AtomicLong(0L);
   private final AtomicLong evictions = new AtomicLong(0L);
   private final AtomicLong fifoHead = new AtomicLong(-1L);
   private final AtomicLong fifoTail = new AtomicLong(-1L);
-  private final EvictionListener evictionListener;
 
-  public FifoOffHeapLongCache(long numEntries, EvictionListener evictionListener) {
-    this.evictionListener = (evictionListener != null)
-                            ? evictionListener
-                            : new NoopEvictionListener();
+  private FifoOffHeapLongCache(final Builder builder) {
+    this.sizeInBytes = ceilingNextPowerOfTwo(builder.size) * BUCKET_SIZE;
+    this.numBuckets = sizeInBytes / BUCKET_SIZE;
+    this.probeMax = Math.min(builder.probeMax, numBuckets);
+    this.neighborhoodSize = builder.neighborhoodSize;
+    this.drainThreshold = builder.drainThreshold;
+    this.evictionThreshold = builder.evictionThreshold;
+    this.evictionListener = builder.evictionListener;
     this.evictionLock = new ReentrantLock();
     this.taskBuffer = new ConcurrentLinkedQueue<>();
-    this.sizeInBytes = ceilingNextPowerOfTwo(numEntries) * BUCKET_SIZE;
-    this.numBuckets = sizeInBytes / BUCKET_SIZE;
-    this.probeMax = Math.min(PROBE_MAX, numBuckets);
 
     this.unsafe = getUnsafe();
     this.hashFunction = Hashing.murmur3_128(); // should we be using the seeded variant?
@@ -114,15 +126,19 @@ public class FifoOffHeapLongCache {
     this.unsafe.setMemory(this.memStart, this.sizeInBytes, (byte) 0); // zero out memory
   }
 
-  public FifoOffHeapLongCache(long numEntries) {
-    this(numEntries, null);
-  }
-
   /**
    * Release the off-heap memory associated with this cache.
    */
   public void destroy() {
     unsafe.freeMemory(memStart);
+  }
+
+  /**
+   * Proxies {@link #destroy()}. Implements AutoCloseable.
+   */
+  @Override
+  public void close() {
+    destroy();
   }
 
   /**
@@ -227,7 +243,7 @@ public class FifoOffHeapLongCache {
     long index = getIndex(hashCode);
 
     // start at `index` then step forward up to (NEIGHBORHOOD - 1) times
-    for (int i=0; i<NEIGHBORHOOD; i++) {
+    for (int i=0; i<neighborhoodSize; i++) {
       long address = addressFromIndex((index + i) % numBuckets);
       if (unsafe.getLong(address) == -1L) {
         // someone is already doing stuff so spin
@@ -280,7 +296,7 @@ public class FifoOffHeapLongCache {
               // if we find an empty bucket within the neighborhood we keep
               // searching till we reach the end of the neighborhood to
               // ensure another thread didn't add the key at a later index
-              if (i >= NEIGHBORHOOD) {
+              if (i >= neighborhoodSize) {
                 // we found an empty bucket and our hash code does
                 // not already exist in the neighborhood so return it
                 return emptyIndex % numBuckets;
@@ -325,10 +341,10 @@ public class FifoOffHeapLongCache {
           }
 
           // now we swap back until the empty bucket is in the neighborhood
-          while (emptyIndex - baseIndex > NEIGHBORHOOD) {
+          while (emptyIndex - baseIndex > neighborhoodSize) {
             boolean foundSwap = false;
-            long minBaseIndex = emptyIndex - (NEIGHBORHOOD - 1);
-            for (int i = NEIGHBORHOOD - 1; i > 0; i--) {
+            long minBaseIndex = emptyIndex - (neighborhoodSize - 1);
+            for (int i = neighborhoodSize - 1; i > 0; i--) {
               long candidateIndex = emptyIndex - i;
               if (candidateIndex < baseIndex) {
                 // we can't use buckets less than our initial index
@@ -468,11 +484,11 @@ public class FifoOffHeapLongCache {
   }
 
   /**
-   * Drains up to {@link #WRITE_BUFFER_DRAIN_THRESHOLD} WriteTasks.
+   * Drains up to {@link #DRAIN_THRESHOLD} WriteTasks.
    */
   @GuardedBy("evictionLock")
   private void drainBuffer() {
-    for (int i = 0; i < WRITE_BUFFER_DRAIN_THRESHOLD; i++) {
+    for (int i = 0; i < drainThreshold; i++) {
       final WriteTask task = taskBuffer.poll();
       if (task == null) {
         break;
@@ -488,7 +504,7 @@ public class FifoOffHeapLongCache {
    */
   @GuardedBy("evictionLock")
   private boolean hasOverflowed() {
-    return getLoadFactor() > EVICTION_THRESHOLD;
+    return getLoadFactor() > evictionThreshold;
   }
 
   /**
@@ -585,6 +601,26 @@ public class FifoOffHeapLongCache {
   }
 
   /**
+   * Returns the Unsafe singleton.
+   * @return sun.misc.Unsafe
+   */
+  private static Unsafe getUnsafe() {
+    try {
+      return Unsafe.getUnsafe();
+    } catch (SecurityException firstUse) {
+      try {
+        Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
+        theUnsafe.setAccessible(true);
+        return (Unsafe) theUnsafe.get(null);
+      } catch (Exception e) {
+        throw new RuntimeException("Unable to acquire Unsafe", e);
+      }
+    }
+  }
+
+  /* ---------------- Write Bookkeeping -------------- */
+
+  /**
    * Runnable that performs the necessary pointer
    * bookkeeping after a write to the hash table.
    */
@@ -634,6 +670,8 @@ public class FifoOffHeapLongCache {
     }
   }
 
+  /* ---------------- Eviction Listener -------------- */
+
   @ThreadSafe
   public static interface EvictionListener {
 
@@ -656,21 +694,97 @@ public class FifoOffHeapLongCache {
     }
   }
 
+  /* ---------------- Builder -------------- */
+
   /**
-   * Returns the Unsafe singleton.
-   * @return sun.misc.Unsafe
+   * A builder creating a {@link FifoOffHeapLongCache}.
+   * Example:
+   * <pre>{@code
+   * FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
+   *     .size(1000)
+   *     .build();
+   * }</pre>
    */
-  private static Unsafe getUnsafe() {
-    try {
-      return Unsafe.getUnsafe();
-    } catch (SecurityException firstUse) {
-      try {
-        Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-        theUnsafe.setAccessible(true);
-        return (Unsafe) theUnsafe.get(null);
-      } catch (Exception e) {
-        throw new RuntimeException("Unable to acquire Unsafe", e);
+  public static class Builder {
+
+    long size = 0;
+    int probeMax = DEFAULT_PROBE_MAX;
+    int neighborhoodSize = DEFAULT_NEIGHBORHOOD_SIZE;
+    int drainThreshold = DEFAULT_DRAIN_THRESHOLD;
+    double evictionThreshold = DEFAULT_EVICTION_THRESHOLD;
+    EvictionListener evictionListener;
+
+    public Builder() {}
+
+    /**
+     * Sets the maximum number of probes to execute when
+     * looking for an empty bucket.
+     */
+    public Builder setProbeMax(int max) {
+      this.probeMax = max;
+      return this;
+    }
+
+    /**
+     * Set the neighborhood size for hopscotch hashing.
+     */
+    public Builder setNeighborhoodSize(int size) {
+      this.neighborhoodSize = size;
+      return this;
+    }
+
+    /**
+     * Set the maximum number of {@link com.maascamp.fohlc.FifoOffHeapLongCache.WriteTask}
+     * to process when draining the write buffer.
+     */
+    public Builder setDrainThreshold(int threshold) {
+      this.drainThreshold = threshold;
+      return this;
+    }
+
+    /**
+     * Set the load factor above which eviction occurs.
+     */
+    public Builder setEvictionThreshold(double threshold) {
+      this.evictionThreshold = threshold;
+      return this;
+    }
+
+    /**
+     * Sets the number of buckes in the cache.
+     * NOTE: actual size will be the closest power of two that
+     * is >= the specified size.
+     */
+    public Builder setSize(long size) {
+      this.size = size;
+      return this;
+    }
+
+    /**
+     * Specifiy an {@link com.maascamp.fohlc.FifoOffHeapLongCache.EvictionListener}
+     * implementation to call on each eviction.
+     */
+    public Builder setEvictionListener(EvictionListener listener) {
+      if (listener == null) {
+        throw new NullPointerException();
       }
+      this.evictionListener = listener;
+      return this;
+    }
+
+    /**
+     * Build and return an initialized FifoOffHeapLongCache instance.
+     */
+    public FifoOffHeapLongCache build() {
+      if (size <= 0) {
+        throw new IllegalStateException();
+      }
+
+      if (evictionListener == null) {
+        evictionListener = new NoopEvictionListener();
+      }
+
+      return new FifoOffHeapLongCache(this);
     }
   }
 }
