@@ -36,7 +36,7 @@ public class CacheMetrics {
         .add("sizeInBytes", sizeInBytes)
         .add("numBuckets", numBuckets)
         .add("numEntries", numEntries)
-        .add("loadFactor", loadFactor)
+        .add("loadFactor", String.format("%.2f", loadFactor))
         .add("hits", hits)
         .add("misses", misses)
         .add("evictions", evictions)

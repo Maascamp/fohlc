@@ -5,12 +5,14 @@ import com.google.common.collect.Lists;
 
 import org.junit.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.spy;
 
@@ -100,12 +102,29 @@ public class TestByteToLongHashTable {
   }
 
   @Test
+  public void testEvictOldest() {
+    double evictionThreshold = 0.8;
+    try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
+        .setSize(100L)
+        .setEvictionThreshold(evictionThreshold)
+        .build()
+    ) {
+      CacheMetrics metrics = cache.getCacheMetrics();
+      long actualSize = (long) (metrics.numBuckets * evictionThreshold);
+      for (int i = 1; i <= actualSize + 1; i++) {
+        cache.put(String.format("string%d", i).getBytes(), i);
+      }
+
+      assertNull(cache.get("string1".getBytes()));
+    }
+  }
+
+  @Test
   public void testFifoConcurrentEvictions() throws InterruptedException {
     AtomicInteger evictionCount = new AtomicInteger(0);
     AtomicLong expected = new AtomicLong(0);
     AtomicBoolean monotonicallyIncreasingEvictions = new AtomicBoolean(true);
-    FifoOffHeapLongCache.EvictionListener listener = spy(
-        new FifoOffHeapLongCache.EvictionListener() {
+    FifoOffHeapLongCache.EvictionListener listener = new FifoOffHeapLongCache.EvictionListener() {
           @Override
           public void onEvict(long key, long value) {
             if (evictionCount.incrementAndGet() < 800 // <- size * evictionThreshold
@@ -113,7 +132,7 @@ public class TestByteToLongHashTable {
               monotonicallyIncreasingEvictions.set(false);
             }
           }
-        });
+        };
     try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
         .setSize(1000L)
         .setEvictionThreshold(0.80)
@@ -147,6 +166,7 @@ public class TestByteToLongHashTable {
         } catch (InterruptedException e) {
         }
       });
+      double took = (double) (System.nanoTime() - start) / 1000000000;
 
       // ensure that the first (size * eviction threshold)
       // entries evicted are monotonically increasing

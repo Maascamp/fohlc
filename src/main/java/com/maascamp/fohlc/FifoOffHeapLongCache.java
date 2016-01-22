@@ -83,9 +83,10 @@ public class FifoOffHeapLongCache implements AutoCloseable {
   private static final int PREV_POINTER_OFFSET = 24;
 
   /**
-   * Empty bucket value.
+   * Special bucket values.
    */
   private static final long EMPTY = 0L;
+  private static final long LOCK = -1L;
 
   private final Lock evictionLock;
   private final Queue<WriteTask> taskBuffer;
@@ -228,7 +229,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
     long address = addressFromIndex(idx);
     unsafe.putLong(address + VALUE_OFFSET, value);
     queueWrite(new WriteTask(address));
-    if (!unsafe.compareAndSwapLong(null, address, -1L, hashCode)) {
+    if (!unsafe.compareAndSwapLong(null, address, LOCK, hashCode)) {
       throw new ConcurrentModificationException("Concurrent modification of key: " + hashCode);
     }
     maybeEvict();
@@ -245,13 +246,13 @@ public class FifoOffHeapLongCache implements AutoCloseable {
     // start at `index` then step forward up to (NEIGHBORHOOD - 1) times
     for (int i=0; i<neighborhoodSize; i++) {
       long address = addressFromIndex((index + i) % numBuckets);
-      if (unsafe.getLong(address) == -1L) {
+      if (unsafe.getLong(address) == LOCK) {
         // someone is already doing stuff so spin
         i--;
-      } else if (unsafe.compareAndSwapLong(null, address, hashCode, -1L)) {
+      } else if (unsafe.compareAndSwapLong(null, address, hashCode, LOCK)) {
         // we've found `hashCode` so return the corresponding value
         long val = unsafe.getLong(address + VALUE_OFFSET);
-        if (!unsafe.compareAndSwapLong(null, address, -1L, hashCode)) {
+        if (!unsafe.compareAndSwapLong(null, address, LOCK, hashCode)) {
           throw new ConcurrentModificationException("Concurrent modification of key: " + hashCode);
         }
         return val;
@@ -274,16 +275,16 @@ public class FifoOffHeapLongCache implements AutoCloseable {
     long baseAddress = addressFromIndex(baseIndex);
     for(;;) {
       long baseHash = unsafe.getLong(baseAddress);
-      if (baseHash == EMPTY && unsafe.compareAndSwapLong(null, baseAddress, EMPTY, -1L)) {
+      if (baseHash == EMPTY && unsafe.compareAndSwapLong(null, baseAddress, EMPTY, LOCK)) {
         // no collision so return baseIndex
         return baseIndex % numBuckets;
       } else if (baseHash == hashCode) {
         // our hash code already exists so return
         return -1L;
-      } else if (baseHash == -1L) {
+      } else if (baseHash == LOCK) {
         // this bucket range is in use so wait till it's not
         continue;
-      } else if (unsafe.compareAndSwapLong(null, baseAddress, baseHash, -1L)) {
+      } else if (unsafe.compareAndSwapLong(null, baseAddress, baseHash, LOCK)) {
         // everything below is wrapped in a try finally so we're
         // guaranteed to unlock the range when we're through with it
         try {
@@ -303,19 +304,19 @@ public class FifoOffHeapLongCache implements AutoCloseable {
               }
 
               long candidateHash = unsafe.getLong(null, candidateAddress);
-              if (candidateHash == -1L) {
+              if (candidateHash == LOCK) {
                 // spin
                 i--;
               } else if (candidateHash == hashCode) {
                 // another thread added our hash code so unlock and return
-                if (!unsafe.compareAndSwapLong(null, emptyAddress, -1L, EMPTY)) {
+                if (!unsafe.compareAndSwapLong(null, emptyAddress, LOCK, EMPTY)) {
                   throw new ConcurrentModificationException(
                       "Concurrent modification of while range loced");
                 }
                 return -1L;
               }
             } else {
-              if (unsafe.compareAndSwapLong(null, candidateAddress, EMPTY, -1L)) {
+              if (unsafe.compareAndSwapLong(null, candidateAddress, EMPTY, LOCK)) {
                 // we found an empty bucket so note it then finish
                 // checking the neighborhood
                 emptyIndex = (baseIndex + i) % numBuckets;
@@ -325,7 +326,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
               }
 
               long candidateHash = unsafe.getLong(null, candidateAddress);
-              if (candidateHash == -1L) {
+              if (candidateHash == LOCK) {
                 // spin
                 i--;
               } else if (candidateHash == hashCode) {
@@ -354,12 +355,12 @@ public class FifoOffHeapLongCache implements AutoCloseable {
               // we've got a candidate so lock (if still necessary) and do swap
               long candidateAddress = addressFromIndex(candidateIndex % numBuckets);
               long candidateHash = unsafe.getLong(candidateAddress);
-              if (candidateHash == -1L) {
+              if (candidateHash == LOCK) {
                 // someone is already doing stuff so spin
                 i++;
               } else if (candidateHash == hashCode) {
                 // another thread already added our hash code so unlock and return
-                if (!unsafe.compareAndSwapLong(null, emptyAddress, -1L, EMPTY)) {
+                if (!unsafe.compareAndSwapLong(null, emptyAddress, LOCK, EMPTY)) {
                   throw new ConcurrentModificationException(
                       "Concurrent modification of key while swapping: " + hashCode);
                 }
@@ -367,7 +368,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
               } else if (getIndex(candidateHash) < minBaseIndex) {
                 // can't swap to a index before minBaseIndex
                 continue;
-              } else if (unsafe.compareAndSwapLong(null, candidateAddress, candidateHash, -1L)) {
+              } else if (unsafe.compareAndSwapLong(null, candidateAddress, candidateHash, LOCK)) {
                 // got a lock on the candidate so do the swap
                 swapEntries(emptyAddress, candidateAddress);
 
@@ -376,7 +377,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
                 candidateAddress = placeholder;
                 emptyIndex = candidateIndex;
                 foundSwap = true;
-                if (!unsafe.compareAndSwapLong(null, candidateAddress, -1L, candidateHash)) {
+                if (!unsafe.compareAndSwapLong(null, candidateAddress, LOCK, candidateHash)) {
                   throw new ConcurrentModificationException(
                       "Concurrent modification of key during swap !!!");
                 }
@@ -393,7 +394,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
 
           return emptyIndex % numBuckets;
         } finally {
-          if (!unsafe.compareAndSwapLong(null, baseAddress, -1L, baseHash)) {
+          if (!unsafe.compareAndSwapLong(null, baseAddress, LOCK, baseHash)) {
             throw new ConcurrentModificationException(
                 "Concurrent modification of locked range !!!");
           }
@@ -422,11 +423,11 @@ public class FifoOffHeapLongCache implements AutoCloseable {
     if (predecessor > 0L) {
       for (;;) {
         long hash = unsafe.getLong(predecessor);
-        if (hash == -1L) {
+        if (hash == LOCK) {
           continue;
-        } else if (unsafe.compareAndSwapLong(null, predecessor, hash, -1L)) {
+        } else if (unsafe.compareAndSwapLong(null, predecessor, hash, LOCK)) {
           unsafe.putLong(predecessor + NEXT_POINTER_OFFSET, a);
-          unsafe.compareAndSwapLong(null, predecessor, -1L, hash);
+          unsafe.compareAndSwapLong(null, predecessor, LOCK, hash);
           unsafe.putLong(a + PREV_POINTER_OFFSET, predecessor);
           break;
         }
@@ -439,12 +440,12 @@ public class FifoOffHeapLongCache implements AutoCloseable {
     if (successor > 0L) {
       for (;;) {
         long hash = unsafe.getLong(successor);
-        if (hash == -1L) {
+        if (hash == LOCK) {
           continue;
-        } else if (unsafe.compareAndSwapLong(null, successor, hash, -1L)) {
+        } else if (unsafe.compareAndSwapLong(null, successor, hash, LOCK)) {
           unsafe.putLong(successor + PREV_POINTER_OFFSET, a);
           unsafe.putLong(a + NEXT_POINTER_OFFSET, successor);
-          unsafe.compareAndSwapLong(null, successor, -1L, hash);
+          unsafe.compareAndSwapLong(null, successor, LOCK, hash);
           break;
         }
       }
@@ -517,24 +518,24 @@ public class FifoOffHeapLongCache implements AutoCloseable {
       // get oldest entry
       long address = fifoHead.get();
       long hashCode = unsafe.getLong(address);
-      if (hashCode == -1L) {
+      if (hashCode == LOCK) {
         // bucket is locked so spin
         continue;
-      } else if (unsafe.compareAndSwapLong(null, fifoHead.get(), hashCode, -1L)) {
+      } else if (unsafe.compareAndSwapLong(null, fifoHead.get(), hashCode, LOCK)) {
         for (;;) {
           // we must also lock the next entry in the list so
           // we can do bookkeeping without risk of it being swapped
           // from under us
           long next = unsafe.getLong(address + NEXT_POINTER_OFFSET);
           long nextHash = unsafe.getLong(next);
-          if (nextHash == -1L) {
+          if (nextHash == LOCK) {
             continue;
-          } else if (unsafe.compareAndSwapLong(null, next, nextHash, -1L)) {
+          } else if (unsafe.compareAndSwapLong(null, next, nextHash, LOCK)) {
             unsafe.putLong(next + PREV_POINTER_OFFSET, -1L);
             fifoHead.set(next);
             numEntries.decrementAndGet();
             evictions.incrementAndGet();
-            if (!unsafe.compareAndSwapLong(null, next, -1L, nextHash)) {
+            if (!unsafe.compareAndSwapLong(null, next, LOCK, nextHash)) {
               throw new ConcurrentModificationException("Concurrent modification of key during eviction !!!");
             }
             break;
@@ -546,7 +547,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
         unsafe.putLong(address + VALUE_OFFSET, EMPTY);
         unsafe.putLong(address + NEXT_POINTER_OFFSET, EMPTY);
         unsafe.putLong(address + PREV_POINTER_OFFSET, EMPTY);
-        if (!unsafe.compareAndSwapLong(null, address, -1L, EMPTY)) {
+        if (!unsafe.compareAndSwapLong(null, address, LOCK, EMPTY)) {
           throw new ConcurrentModificationException("Concurrent modification of key during delete !!!");
         }
         break;
@@ -558,7 +559,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
    * Maps a hash code into the bucket range.
    */
   private long getIndex(long hashCode) {
-    return Math.abs(hashCode) % numBuckets;
+    return Math.abs(hashCode % numBuckets);
   }
 
   /**
@@ -570,12 +571,24 @@ public class FifoOffHeapLongCache implements AutoCloseable {
 
   /**
    * Generate a 64 bit hash code from the specified byte array.
+   *
+   * Since the {@link #LOCK} and {@link #EMPTY} values are special
+   * some checks are added to ensure we don't return either from
+   * this function.
    */
   private long hash(byte[] val) {
-    return hashFunction.newHasher(val.length)
+    long hash = hashFunction.newHasher(val.length)
         .putBytes(val)
         .hash()
         .asLong();
+
+    if (hash == LOCK) {
+      return hash - 1;
+    } else if (hash == EMPTY) {
+      return hash + 1;
+    } else {
+      return hash;
+    }
   }
 
   /**
@@ -648,9 +661,9 @@ public class FifoOffHeapLongCache implements AutoCloseable {
         for (;;) {
           long currentAddress = fifoTail.get();
           long currentHash = unsafe.getLong(currentAddress);
-          if (currentHash == -1L) {
+          if (currentHash == LOCK) {
             continue; // spin until bucket is available
-          } else if (unsafe.compareAndSwapLong(null, fifoTail.get(), currentHash, -1L)) {
+          } else if (unsafe.compareAndSwapLong(null, fifoTail.get(), currentHash, LOCK)) {
             // update the previous entry's pointer to point to the new
             if (!unsafe.compareAndSwapLong(null, currentAddress + NEXT_POINTER_OFFSET, -1L, newAddress)) {
               throw new RuntimeException("updating a tail that is not tail !!!");
@@ -660,7 +673,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
             unsafe.putLong(newAddress + NEXT_POINTER_OFFSET, -1L);
             unsafe.putLong(newAddress + PREV_POINTER_OFFSET, currentAddress);
             fifoTail.set(newAddress);
-            if (!unsafe.compareAndSwapLong(null, currentAddress, -1L, currentHash)) {
+            if (!unsafe.compareAndSwapLong(null, currentAddress, LOCK, currentHash)) {
               throw new ConcurrentModificationException("Concurrent modification during write bookkeeping !!!");
             }
             break;
