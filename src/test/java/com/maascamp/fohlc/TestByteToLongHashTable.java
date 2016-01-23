@@ -5,7 +5,6 @@ import com.google.common.collect.Lists;
 
 import org.junit.Test;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -14,7 +13,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Mockito.spy;
 
 @SuppressWarnings("all")
 public class TestByteToLongHashTable {
@@ -34,10 +32,10 @@ public class TestByteToLongHashTable {
       }
 
       CacheMetrics metrics = cache.getCacheMetrics();
-      assertTrue("Expected 10", metrics.numEntries == 10);
-      assertTrue("Expected 128", metrics.numBuckets == 128);
-      assertTrue("Expected 3072 (128 * 32)", metrics.sizeInBytes == 4096);
-      assertTrue("Expected 0.8 (10 / 128)", metrics.loadFactor == 0.08);
+      assertTrue(metrics.numEntries == 10);
+      assertTrue(metrics.numBuckets == 128);
+      assertTrue(metrics.sizeInBytes == 4096);
+      assertTrue(metrics.loadFactor == 0.08); // 10/128
     }
   }
 
@@ -64,10 +62,10 @@ public class TestByteToLongHashTable {
         .build()
     ) {
       Long existing = cache.getAndPutIfEmpty("test".getBytes(), 100L);
-      assertEquals(existing, null);
+      assertNull(existing);
 
       existing = cache.getAndPutIfEmpty("test".getBytes(), 200L);
-      assertTrue(existing == 100L);
+      assertEquals((long) existing, 100L);
     }
   }
 
@@ -82,6 +80,26 @@ public class TestByteToLongHashTable {
       }
 
       assertEquals(1L, (long) cache.getOldestEntry());
+    }
+  }
+
+  @Test
+  public void testPutDuplicate() {
+    try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
+        .setSize(100L)
+        .build()
+    ) {
+      for (int i = 1; i <= 10; i++) {
+        cache.put(String.format("string%d", i).getBytes(), i);
+      }
+      long size = cache.getCacheMetrics().numEntries;
+
+      // try to add the same values again
+      for (int i = 1; i <= 10; i++) {
+        cache.put(String.format("string%d", i).getBytes(), i);
+      }
+
+      assertEquals(size, (long) cache.getCacheMetrics().numEntries);
     }
   }
 
