@@ -161,10 +161,8 @@ public class TestByteToLongHashTable {
       CacheMetrics metrics = cache.getCacheMetrics();
       final long numBuckets = metrics.numBuckets;
       List<Thread> threads = Lists.newArrayList();
-      final AtomicLong id = new AtomicLong(0);
       for (int i = 0; i < 8; i++) {
         threads.add(new Thread(() -> {
-          long start = System.nanoTime();
           try {
             for (int j = 1; j <= numBuckets; j++) {
               String key = String.format("string-%d", j);
@@ -189,6 +187,43 @@ public class TestByteToLongHashTable {
       // ensure that the first (size * eviction threshold)
       // entries evicted are monotonically increasing
       assertTrue(monotonicallyIncreasingEvictions.get());
+    }
+  }
+
+  @Test
+  public void testConcurrentSwapping() {
+    try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
+        .setSize(1000L)
+        .setNeighborhoodSize(32)
+        .setProbeMax(128)
+        .setEvictionThreshold(0.80)
+        .build()
+    ) {
+      CacheMetrics metrics = cache.getCacheMetrics();
+      final long numBuckets = metrics.numBuckets;
+      List<Thread> threads = Lists.newArrayList();
+      final AtomicInteger idGenerator = new AtomicInteger(0);
+      for (int i = 0; i < 8; i++) {
+        threads.add(new Thread(() -> {
+          int id = idGenerator.incrementAndGet();
+          try {
+            for (int j = 1; j <= numBuckets; j++) {
+              String key = String.format("string-%d-%d", id, j);
+              cache.put(key.getBytes(), j);
+            }
+          } catch (Exception e) {
+            e.printStackTrace();
+          }
+        }));
+      }
+
+      threads.forEach(t -> t.start());
+      threads.forEach(t -> {
+        try {
+          t.join();
+        } catch (InterruptedException e) {
+        }
+      });
     }
   }
 }
