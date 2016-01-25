@@ -6,7 +6,6 @@ import com.google.common.hash.Hashing;
 import sun.misc.Unsafe;
 
 import java.lang.reflect.Field;
-import java.util.ArrayList;
 import java.util.ConcurrentModificationException;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -354,7 +353,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
             long minBaseIndex = emptyIndex - (neighborhoodSize - 1);
             for (int i = neighborhoodSize - 1; i > 0; i--) {
               long candidateIndex = emptyIndex - i;
-              if (candidateIndex < baseIndex) {
+              if (candidateIndex <= baseIndex) {
                 // we can't use buckets less than our initial index
                 continue;
               }
@@ -377,18 +376,19 @@ public class FifoOffHeapLongCache implements AutoCloseable {
                 continue;
               } else if (unsafe.compareAndSwapLong(null, candidateAddress, candidateHash, LOCK)) {
                 // got a lock on the candidate so do the swap
-                swapEntries(emptyAddress, candidateAddress);
+                if (swapEntries(emptyAddress, candidateAddress, baseAddress)) {
+                  long placeholder = emptyAddress;
+                  emptyAddress = candidateAddress;
+                  candidateAddress = placeholder;
+                  emptyIndex = candidateIndex;
+                  foundSwap = true;
+                }
 
-                long placeholder = emptyAddress;
-                emptyAddress = candidateAddress;
-                candidateAddress = placeholder;
-                emptyIndex = candidateIndex;
-                foundSwap = true;
                 if (!unsafe.compareAndSwapLong(null, candidateAddress, LOCK, candidateHash)) {
                   throw new ConcurrentModificationException(
                       "Concurrent modification of key during swap !!!");
                 }
-                break;
+                if (foundSwap) break;
               }
             }
 
@@ -418,16 +418,34 @@ public class FifoOffHeapLongCache implements AutoCloseable {
    * for the duration of this operation. It's up to the caller to
    * lock/release each entry.
    */
-  private void swapEntries(long a, long b) {
-    // swap `a`/`b` values
-    long placeholder = unsafe.getLong(b + VALUE_OFFSET);
-    //unsafe.putLong(b + VALUE_OFFSET, unsafe.getLong(a + VALUE_OFFSET));
-    unsafe.putLong(b + VALUE_OFFSET, EMPTY);
-    unsafe.putLong(a + VALUE_OFFSET, placeholder);
+  private boolean swapEntries(long a, long b, long base) {
+
+    // update `b`'s successor to point back to `a`
+    // and update `a` to point to `b`'s successor
+    long successor = unsafe.getLong(b + NEXT_POINTER_OFFSET);
+    long predecessor = unsafe.getLong(b + PREV_POINTER_OFFSET);
+    if (successor == 0 || predecessor == 0) {
+      return false;
+    } else if (successor == base || predecessor == base) {
+      return false;
+    }
+
+    if (successor != -1L) {
+      for (;;) {
+        long hash = unsafe.getLong(successor);
+        if (hash == LOCK) {
+          continue;
+        } else if (unsafe.compareAndSwapLong(null, successor, hash, LOCK)) {
+          unsafe.putLong(successor + PREV_POINTER_OFFSET, a);
+          unsafe.compareAndSwapLong(null, successor, LOCK, hash);
+          break;
+        }
+      }
+    }
+    unsafe.putLong(a + NEXT_POINTER_OFFSET, successor);
 
     // update `b`'s predecessor to point to `a`
     // and update `a` to point back to `b`'s predecessor
-    long predecessor = unsafe.getLong(b + PREV_POINTER_OFFSET);
     if (predecessor != -1L) {
       for (;;) {
         long hash = unsafe.getLong(predecessor);
@@ -436,7 +454,6 @@ public class FifoOffHeapLongCache implements AutoCloseable {
         } else if (unsafe.compareAndSwapLong(null, predecessor, hash, LOCK)) {
           //long prev = unsafe.getLong(a + PREV_POINTER_OFFSET);
           unsafe.putLong(predecessor + NEXT_POINTER_OFFSET, a);
-          unsafe.putLong(a + PREV_POINTER_OFFSET, predecessor);
           if (!unsafe.compareAndSwapLong(null, predecessor, LOCK, hash)) {
             throw new ConcurrentModificationException(
                 "Concurrent modification during swap bookkeeping !!!");
@@ -445,33 +462,20 @@ public class FifoOffHeapLongCache implements AutoCloseable {
         }
       }
     }
+    unsafe.putLong(a + PREV_POINTER_OFFSET, predecessor);
 
-    // update `b`'s successor to point back to `a`
-    // and update `a` to point to `b`'s successor
-    long successor = unsafe.getLong(b + NEXT_POINTER_OFFSET);
-    if (successor != -1L) {
-      for (;;) {
-        long hash = unsafe.getLong(successor);
-        if (hash == LOCK) {
-          continue;
-        } else if (unsafe.compareAndSwapLong(null, successor, hash, LOCK)) {
-          unsafe.putLong(successor + PREV_POINTER_OFFSET, a);
-          unsafe.putLong(a + NEXT_POINTER_OFFSET, successor);
-          unsafe.compareAndSwapLong(null, successor, LOCK, hash);
-          break;
-        }
-      }
-    }
+    // swap `a`/`b` values
+    long placeholder = unsafe.getLong(b + VALUE_OFFSET);
+    //unsafe.putLong(b + VALUE_OFFSET, unsafe.getLong(a + VALUE_OFFSET));
+    unsafe.putLong(b + VALUE_OFFSET, EMPTY);
+    unsafe.putLong(a + VALUE_OFFSET, placeholder);
 
     // empty `b` and update fifo pointers if necessary
     unsafe.putLong(b + NEXT_POINTER_OFFSET, EMPTY);
     unsafe.putLong(b + PREV_POINTER_OFFSET, EMPTY);
-    if (fifoHead.compareAndSet(b, a)){
-      int s = 0;
-    }
-    if (fifoTail.compareAndSet(b, a)) {
-      int s = 1;
-    }
+    fifoHead.compareAndSet(b, a);
+    fifoTail.compareAndSet(b, a);
+    return true;
   }
 
   /**

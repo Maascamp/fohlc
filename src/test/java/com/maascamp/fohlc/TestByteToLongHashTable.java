@@ -197,6 +197,7 @@ public class TestByteToLongHashTable {
         .setNeighborhoodSize(32)
         .setProbeMax(128)
         .setEvictionThreshold(0.80)
+        .setDrainThreshold(16)
         .build()
     ) {
       CacheMetrics metrics = cache.getCacheMetrics();
