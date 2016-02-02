@@ -194,10 +194,10 @@ public class TestByteToLongHashTable {
   public void testConcurrentSwapping() {
     try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
         .setSize(1000L)
-        .setNeighborhoodSize(32)
-        .setProbeMax(128)
+        .setNeighborhoodSize(64)
+        .setProbeMax(1024)
         .setEvictionThreshold(0.80)
-        .setDrainThreshold(16)
+        .setDrainThreshold(128)
         .build()
     ) {
       CacheMetrics metrics = cache.getCacheMetrics();
@@ -208,7 +208,7 @@ public class TestByteToLongHashTable {
         threads.add(new Thread(() -> {
           int id = idGenerator.incrementAndGet();
           try {
-            for (int j = 1; j <= numBuckets; j++) {
+            for (int j = 1; j <= 1000; j++) {
               String key = String.format("string-%d-%d", id, j);
               cache.put(key.getBytes(), j);
             }

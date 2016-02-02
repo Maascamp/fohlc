@@ -88,6 +88,12 @@ public class FifoOffHeapLongCache implements AutoCloseable {
   private static final long EMPTY = 0L;
   private static final long LOCK = -1L;
 
+  /**
+   * Deadlock avoidance.
+   */
+  private static final int MAX_LOCK_ATTEMPTS = 100;
+  private static final int MAX_RETRIES = 10;
+
   private final Lock evictionLock;
   private final Queue<WriteTask> taskBuffer;
 
@@ -220,10 +226,30 @@ public class FifoOffHeapLongCache implements AutoCloseable {
    */
   private void _put(byte[] key, long value) {
     final long hashCode = hash(key);
+    long idx = -1L;
 
-    long idx = findAvailableBucket(hashCode);
-    if (idx < 0) {
-      return; // we found our hashCode after all
+    int lockAttempts = 0;
+    do {
+      try {
+        idx = findAvailableBucket(hashCode);
+        if (idx < 0) {
+          // we found our hashCode after all
+          return;
+        }
+        break;
+      } catch (PossibleDeadlockException e) {
+        lockAttempts++;
+      } catch (RuntimeException e) {
+        maybeEvict();
+        lockAttempts++;
+      }
+    } while (lockAttempts < MAX_RETRIES);
+
+
+    if (lockAttempts == MAX_RETRIES) {
+      // we were unable to acquire our locks in a reasonable amount of time
+      throw new RuntimeException(
+          String.format("Unable to acquire needed locks after  %d attempts", lockAttempts));
     }
 
     long address = addressFromIndex(idx);
@@ -269,6 +295,9 @@ public class FifoOffHeapLongCache implements AutoCloseable {
    *
    * It is the responsibility of the caller to unlock the bucket when they're
    * done with it.
+   *
+   * NOTE: this code can be simplified greatly (to-do), but has many subtleties
+   * despite all the comments. Tread carefully.
    */
   private long findAvailableBucket(long hashCode) {
     long baseIndex = getIndex(hashCode);
@@ -289,12 +318,44 @@ public class FifoOffHeapLongCache implements AutoCloseable {
       } else if (unsafe.compareAndSwapLong(null, baseAddress, baseHash, LOCK)) {
         // everything below is wrapped in a try/finally so we're
         // guaranteed to unlock the range when we're through with it
+        long emptyIndex = -1L;
+        long emptyAddress = -1L;
+        long candidateAddress = -1L;
         try {
-          long emptyIndex = -1L;
-          long emptyAddress = -1L;
+          int lockAttempts = 0;
           for (int i = 1; i < probeMax; i++) {
-            long candidateAddress = addressFromIndex((baseIndex + i) % numBuckets);
-            if (emptyAddress > 0) {
+            candidateAddress = addressFromIndex((baseIndex + i) % numBuckets);
+            if (emptyAddress < 0) {
+              if (unsafe.compareAndSwapLong(null, candidateAddress, EMPTY, LOCK)) {
+                // We found an empty bucket.
+                // If we're still withing the neighborhood, finish checking to
+                // make sure the value doesn't exist further on. If we're
+                // already out of the neighborhood then just skip to swapping.
+                emptyIndex = baseIndex + i;
+                emptyAddress = candidateAddress;
+                lockAttempts = 0;
+                if (i < neighborhoodSize) {
+                  continue;
+                } else {
+                  break;
+                }
+              }
+
+              long candidateHash = unsafe.getLongVolatile(null, candidateAddress);
+              if (candidateHash == LOCK) {
+                // spin
+                if (lockAttempts >= MAX_LOCK_ATTEMPTS) {
+                  throw new PossibleDeadlockException();
+                }
+                lockAttempts++;
+                i--;
+              } else if (candidateHash == hashCode) {
+                // hash code was added so return (no need to unlock here)
+                return -1L;
+              } else {
+                lockAttempts = 0;
+              }
+            } else {
               // we found an empty bucket within the neighborhood so keep
               // searching till we reach the end of the neighborhood to
               // ensure another thread didn't add the key at a later index
@@ -304,9 +365,13 @@ public class FifoOffHeapLongCache implements AutoCloseable {
                 return emptyIndex % numBuckets;
               }
 
-              long candidateHash = unsafe.getLong(null, candidateAddress);
+              long candidateHash = unsafe.getLongVolatile(null, candidateAddress);
               if (candidateHash == LOCK) {
                 // spin
+                if (lockAttempts >= MAX_LOCK_ATTEMPTS) {
+                  throw new PossibleDeadlockException();
+                }
+                lockAttempts++;
                 i--;
               } else if (candidateHash == hashCode) {
                 // another thread added hashCode so unlock and return
@@ -315,29 +380,8 @@ public class FifoOffHeapLongCache implements AutoCloseable {
                       "Concurrent modification of while range locked");
                 }
                 return -1L;
-              }
-            } else {
-              if (unsafe.compareAndSwapLong(null, candidateAddress, EMPTY, LOCK)) {
-                // We found an empty bucket.
-                // If we're still withing the neighborhood, finish checking to
-                // make sure the value doesn't exist further on. If we're
-                // already out of the neighborhood then just skip to swapping.
-                emptyIndex = (baseIndex + i) % numBuckets;
-                emptyAddress = candidateAddress;
-                if (i < neighborhoodSize) {
-                  continue;
-                } else {
-                  break;
-                }
-              }
-
-              long candidateHash = unsafe.getLong(null, candidateAddress);
-              if (candidateHash == LOCK) {
-                // spin
-                i--;
-              } else if (candidateHash == hashCode) {
-                // hash code was added so return (no need to unlock here)
-                return -1L;
+              } else {
+                lockAttempts = 0;
               }
             }
           }
@@ -351,6 +395,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
           while (emptyIndex - baseIndex > neighborhoodSize) {
             boolean foundSwap = false;
             long minBaseIndex = emptyIndex - (neighborhoodSize - 1);
+            lockAttempts = 0;
             for (int i = neighborhoodSize - 1; i > 0; i--) {
               long candidateIndex = emptyIndex - i;
               if (candidateIndex <= baseIndex) {
@@ -359,10 +404,14 @@ public class FifoOffHeapLongCache implements AutoCloseable {
               }
 
               // we've got a candidate so lock (if still necessary) and do swap
-              long candidateAddress = addressFromIndex(candidateIndex % numBuckets);
-              long candidateHash = unsafe.getLong(candidateAddress);
+              candidateAddress = addressFromIndex(candidateIndex % numBuckets);
+              long candidateHash = unsafe.getLongVolatile(null, candidateAddress);
               if (candidateHash == LOCK) {
                 // someone is already doing stuff so spin
+                if (lockAttempts >= MAX_LOCK_ATTEMPTS) {
+                  throw new PossibleDeadlockException();
+                }
+                lockAttempts++;
                 i++;
               } else if (candidateHash == hashCode) {
                 // another thread already added our hash code so unlock and return
@@ -376,19 +425,25 @@ public class FifoOffHeapLongCache implements AutoCloseable {
                 continue;
               } else if (unsafe.compareAndSwapLong(null, candidateAddress, candidateHash, LOCK)) {
                 // got a lock on the candidate so do the swap
-                if (swapEntries(emptyAddress, candidateAddress, baseAddress)) {
-                  long placeholder = emptyAddress;
-                  emptyAddress = candidateAddress;
-                  candidateAddress = placeholder;
-                  emptyIndex = candidateIndex;
-                  foundSwap = true;
+                try {
+                  if (swapEntries(emptyAddress, candidateAddress, baseAddress)) {
+                    long placeholder = emptyAddress;
+                    emptyAddress = candidateAddress;
+                    candidateAddress = placeholder;
+                    emptyIndex = candidateIndex;
+                    foundSwap = true;
+                  }
+                } finally {
+                  // always unlock the candidate addresss on the way out
+                  if (!unsafe.compareAndSwapLong(null, candidateAddress, LOCK, candidateHash)) {
+                    throw new ConcurrentModificationException(
+                        "Concurrent modification of key during swap !!!");
+                  }
                 }
 
-                if (!unsafe.compareAndSwapLong(null, candidateAddress, LOCK, candidateHash)) {
-                  throw new ConcurrentModificationException(
-                      "Concurrent modification of key during swap !!!");
+                if (foundSwap) {
+                  break;
                 }
-                if (foundSwap) break;
               }
             }
 
@@ -400,7 +455,17 @@ public class FifoOffHeapLongCache implements AutoCloseable {
           }
 
           return emptyIndex % numBuckets;
+        } catch (RuntimeException exception) {
+          if (emptyAddress > 0) {
+            // we have locked an empty bucket so unlock before propagating
+            if (!unsafe.compareAndSwapLong(null, emptyAddress, LOCK, EMPTY)) {
+              throw new ConcurrentModificationException(
+                  "Concurrent modification of key during swap !!!");
+            }
+          }
+          throw exception;
         } finally {
+          // unlock the bucket range
           if (!unsafe.compareAndSwapLong(null, baseAddress, LOCK, baseHash)) {
             throw new ConcurrentModificationException(
                 "Concurrent modification of locked range !!!");
@@ -419,40 +484,70 @@ public class FifoOffHeapLongCache implements AutoCloseable {
    * lock/release each entry.
    */
   private boolean swapEntries(long a, long b, long base) {
-
-    // update `b`'s successor to point back to `a`
-    // and update `a` to point to `b`'s successor
+    int lockAttempts = 0;
     long successor = unsafe.getLong(b + NEXT_POINTER_OFFSET);
     long predecessor = unsafe.getLong(b + PREV_POINTER_OFFSET);
-    if (successor == 0 || predecessor == 0) {
-      return false;
-    } else if (successor == base || predecessor == base) {
+    if (successor == 0
+        || predecessor == 0
+        || successor == base
+        || predecessor == base) {
+
       return false;
     }
 
+    // change `b`s relationships with its successor
+    // and predecessor to be owned by `a`
     if (successor != -1L) {
       for (;;) {
         long hash = unsafe.getLong(successor);
         if (hash == LOCK) {
-          continue;
+          if (lockAttempts >= MAX_LOCK_ATTEMPTS) {
+            throw new PossibleDeadlockException();
+          }
+          lockAttempts++;
         } else if (unsafe.compareAndSwapLong(null, successor, hash, LOCK)) {
-          unsafe.putLong(successor + PREV_POINTER_OFFSET, a);
-          unsafe.compareAndSwapLong(null, successor, LOCK, hash);
+          lockAttempts = 0;
+          try {
+            unsafe.putLong(successor + PREV_POINTER_OFFSET, a);
+            if (predecessor != -1L) {
+              for (;;) {
+                long predHash = unsafe.getLong(predecessor);
+                if (predHash == LOCK) {
+                  if (lockAttempts >= MAX_LOCK_ATTEMPTS) {
+                    unsafe.putLong(successor + PREV_POINTER_OFFSET, b);
+                    throw new PossibleDeadlockException();
+                  }
+                  lockAttempts++;
+                  continue;
+                } else if (unsafe.compareAndSwapLong(null, predecessor, predHash, LOCK)) {
+                  unsafe.putLong(predecessor + NEXT_POINTER_OFFSET, a);
+                  if (!unsafe.compareAndSwapLong(null, predecessor, LOCK, predHash)) {
+                    throw new ConcurrentModificationException(
+                        "Concurrent modification during swap bookkeeping !!!");
+                  }
+                  break;
+                }
+              }
+            }
+          } finally {
+            if (!unsafe.compareAndSwapLong(null, successor, LOCK, hash)) {
+              throw new ConcurrentModificationException(
+                  "Concurrent modification during swap bookkeeping !!!");
+            }
+          }
           break;
         }
       }
-    }
-    unsafe.putLong(a + NEXT_POINTER_OFFSET, successor);
-
-    // update `b`'s predecessor to point to `a`
-    // and update `a` to point back to `b`'s predecessor
-    if (predecessor != -1L) {
+    } else if (predecessor != -1L) {
       for (;;) {
         long hash = unsafe.getLong(predecessor);
         if (hash == LOCK) {
+          if (lockAttempts >= MAX_LOCK_ATTEMPTS) {
+            throw new PossibleDeadlockException();
+          }
+          lockAttempts++;
           continue;
         } else if (unsafe.compareAndSwapLong(null, predecessor, hash, LOCK)) {
-          //long prev = unsafe.getLong(a + PREV_POINTER_OFFSET);
           unsafe.putLong(predecessor + NEXT_POINTER_OFFSET, a);
           if (!unsafe.compareAndSwapLong(null, predecessor, LOCK, hash)) {
             throw new ConcurrentModificationException(
@@ -462,19 +557,22 @@ public class FifoOffHeapLongCache implements AutoCloseable {
         }
       }
     }
+
+    unsafe.putLong(a + NEXT_POINTER_OFFSET, successor);
     unsafe.putLong(a + PREV_POINTER_OFFSET, predecessor);
 
-    // swap `a`/`b` values
+    // now swap values
     long placeholder = unsafe.getLong(b + VALUE_OFFSET);
     //unsafe.putLong(b + VALUE_OFFSET, unsafe.getLong(a + VALUE_OFFSET));
     unsafe.putLong(b + VALUE_OFFSET, EMPTY);
     unsafe.putLong(a + VALUE_OFFSET, placeholder);
 
-    // empty `b` and update fifo pointers if necessary
+    // finally, empty `b` and update fifo pointers if necessary
     unsafe.putLong(b + NEXT_POINTER_OFFSET, EMPTY);
     unsafe.putLong(b + PREV_POINTER_OFFSET, EMPTY);
     fifoHead.compareAndSet(b, a);
     fifoTail.compareAndSet(b, a);
+
     return true;
   }
 
@@ -820,4 +918,6 @@ public class FifoOffHeapLongCache implements AutoCloseable {
       return new FifoOffHeapLongCache(this);
     }
   }
+
+  private static class PossibleDeadlockException extends RuntimeException {}
 }
