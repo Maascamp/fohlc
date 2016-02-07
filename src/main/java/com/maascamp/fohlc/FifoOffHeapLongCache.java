@@ -3,6 +3,8 @@ package com.maascamp.fohlc;
 import com.google.common.hash.HashFunction;
 import com.google.common.hash.Hashing;
 
+import com.sun.istack.internal.NotNull;
+
 import sun.misc.Unsafe;
 
 import java.lang.reflect.Field;
@@ -154,7 +156,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
    * @return The value associated with the specified key or null
    * if it doesn't exist.
    */
-  public Long get(byte[] key) {
+  public Long get(@NotNull byte[] key) {
     final Long val = _get(key);
     if (val == null) {
       misses.incrementAndGet();
@@ -170,7 +172,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
    *
    * @return The associated value if it exists or null
    */
-  public Long getAndPutIfEmpty(byte[] key, long value) {
+  public Long getAndPutIfEmpty(@NotNull byte[] key, long value) {
     final Long val = _get(key);
     if (val == null) {
       _put(key, value);
@@ -188,7 +190,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
    *
    * If the key already exists in the cache this method is a no-op.
    */
-  public void put(byte[] key, long value) {
+  public void put(@NotNull byte[] key, long value) {
     // if hash table already contains value do nothing
     final Long val = _get(key);
     if (val == null) {
@@ -249,7 +251,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
     if (lockAttempts == MAX_RETRIES) {
       // we were unable to acquire our locks in a reasonable amount of time
       throw new RuntimeException(
-          String.format("Unable to acquire needed locks after  %d attempts", lockAttempts));
+          String.format("Unable to acquire locks after %d attempts", lockAttempts));
     }
 
     long address = addressFromIndex(idx);
@@ -320,11 +322,10 @@ public class FifoOffHeapLongCache implements AutoCloseable {
         // guaranteed to unlock the range when we're through with it
         long emptyIndex = -1L;
         long emptyAddress = -1L;
-        long candidateAddress = -1L;
         try {
           int lockAttempts = 0;
           for (int i = 1; i < probeMax; i++) {
-            candidateAddress = addressFromIndex((baseIndex + i) % numBuckets);
+            long candidateAddress = addressFromIndex((baseIndex + i) % numBuckets);
             if (emptyAddress < 0) {
               if (unsafe.compareAndSwapLong(null, candidateAddress, EMPTY, LOCK)) {
                 // We found an empty bucket.
@@ -404,9 +405,14 @@ public class FifoOffHeapLongCache implements AutoCloseable {
               }
 
               // we've got a candidate so lock (if still necessary) and do swap
-              candidateAddress = addressFromIndex(candidateIndex % numBuckets);
+              long candidateAddress = addressFromIndex(candidateIndex % numBuckets);
               long candidateHash = unsafe.getLongVolatile(null, candidateAddress);
-              if (candidateHash == LOCK) {
+              if (getIndex(candidateHash) < minBaseIndex) {
+                // can't swap to a index before minBaseIndex
+                // we do this check first so we don't wait on
+                // ineligible indexes that may be locked
+                continue;
+              } else if (candidateHash == LOCK) {
                 // someone is already doing stuff so spin
                 if (lockAttempts >= MAX_LOCK_ATTEMPTS) {
                   throw new PossibleDeadlockException();
@@ -420,9 +426,6 @@ public class FifoOffHeapLongCache implements AutoCloseable {
                       "Concurrent modification of key while swapping: " + hashCode);
                 }
                 return -1L;
-              } else if (getIndex(candidateHash) < minBaseIndex) {
-                // can't swap to a index before minBaseIndex
-                continue;
               } else if (unsafe.compareAndSwapLong(null, candidateAddress, candidateHash, LOCK)) {
                 // got a lock on the candidate so do the swap
                 try {
@@ -434,7 +437,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
                     foundSwap = true;
                   }
                 } finally {
-                  // always unlock the candidate addresss on the way out
+                  // always unlock the candidate address on the way out
                   if (!unsafe.compareAndSwapLong(null, candidateAddress, LOCK, candidateHash)) {
                     throw new ConcurrentModificationException(
                         "Concurrent modification of key during swap !!!");
@@ -518,7 +521,6 @@ public class FifoOffHeapLongCache implements AutoCloseable {
                     throw new PossibleDeadlockException();
                   }
                   lockAttempts++;
-                  continue;
                 } else if (unsafe.compareAndSwapLong(null, predecessor, predHash, LOCK)) {
                   unsafe.putLong(predecessor + NEXT_POINTER_OFFSET, a);
                   if (!unsafe.compareAndSwapLong(null, predecessor, LOCK, predHash)) {
@@ -546,7 +548,6 @@ public class FifoOffHeapLongCache implements AutoCloseable {
             throw new PossibleDeadlockException();
           }
           lockAttempts++;
-          continue;
         } else if (unsafe.compareAndSwapLong(null, predecessor, hash, LOCK)) {
           unsafe.putLong(predecessor + NEXT_POINTER_OFFSET, a);
           if (!unsafe.compareAndSwapLong(null, predecessor, LOCK, hash)) {
@@ -767,7 +768,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
     @GuardedBy("evictionLock")
     public void run() {
       if (numEntries.getAndIncrement() == 0L) {
-        /* first entry into the hash table */
+        // first entry into the hash table
         // no need to worry about locking since we
         // can't be swapping entries at this point
         unsafe.putLong(newAddress + NEXT_POINTER_OFFSET, -1L);
@@ -804,7 +805,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
   /* ---------------- Eviction Listener -------------- */
 
   @ThreadSafe
-  public static interface EvictionListener {
+  public interface EvictionListener {
 
     /**
      * Called once for each evicted entry.
@@ -812,7 +813,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
      * Implementations should be thread-safe as this method may be called
      * by any thread writing to the cache.
      */
-    public void onEvict(long key, long value);
+    void onEvict(long key, long value);
   }
 
   /**
@@ -820,9 +821,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
    */
   private static class NoopEvictionListener implements EvictionListener {
     @Override
-    public void onEvict(long key, long value) {
-      return;
-    }
+    public void onEvict(long key, long value) {}
   }
 
   /* ---------------- Builder -------------- */

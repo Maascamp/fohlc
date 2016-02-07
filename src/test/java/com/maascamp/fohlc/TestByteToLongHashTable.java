@@ -5,6 +5,8 @@ import com.google.common.collect.Lists;
 
 import org.junit.Test;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -18,7 +20,7 @@ import static org.junit.Assert.assertTrue;
 public class TestByteToLongHashTable {
 
   @Test
-  public void testBookKeeping() {
+  public void testCacheMetrics() {
 
     try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
         .setSize(100L)
@@ -36,6 +38,36 @@ public class TestByteToLongHashTable {
       assertTrue(metrics.numBuckets == 128);
       assertTrue(metrics.sizeInBytes == 4096);
       assertTrue(metrics.loadFactor == 0.08); // 10/128
+    }
+  }
+
+  @Test(expected = NullPointerException.class)
+  public void testGet_Null() {
+    try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
+        .setSize(100L)
+        .build()
+    ) {
+      cache.get(null);
+    }
+  }
+
+  @Test(expected = NullPointerException.class)
+  public void testPut_Null() {
+    try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
+        .setSize(100L)
+        .build()
+    ) {
+      cache.put(null, 1);
+    }
+  }
+
+  @Test(expected = NullPointerException.class)
+  public void testGetAndPutIfEmpty_Null() {
+    try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
+        .setSize(100L)
+        .build()
+    ) {
+      cache.getAndPutIfEmpty(null, 1);
     }
   }
 
@@ -160,7 +192,8 @@ public class TestByteToLongHashTable {
 
       CacheMetrics metrics = cache.getCacheMetrics();
       final long numBuckets = metrics.numBuckets;
-      List<Thread> threads = Lists.newArrayList();
+      final List<Thread> threads = Lists.newArrayList();
+      final List<Throwable> exceptions = Collections.synchronizedList(new ArrayList<Throwable>());
       for (int i = 0; i < 8; i++) {
         threads.add(new Thread(() -> {
           try {
@@ -169,7 +202,7 @@ public class TestByteToLongHashTable {
               cache.put(key.getBytes(), j);
             }
           } catch (Exception e) {
-            e.printStackTrace();
+            exceptions.add(e);
           }
         }));
       }
@@ -187,11 +220,12 @@ public class TestByteToLongHashTable {
       // ensure that the first (size * eviction threshold)
       // entries evicted are monotonically increasing
       assertTrue(monotonicallyIncreasingEvictions.get());
+      assertEquals(exceptions.size(), 0);
     }
   }
 
   @Test
-  public void testConcurrentSwapping() {
+  public void testInduceDeadlock() {
     try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
         .setSize(1000L)
         .setNeighborhoodSize(64)
@@ -202,7 +236,8 @@ public class TestByteToLongHashTable {
     ) {
       CacheMetrics metrics = cache.getCacheMetrics();
       final long numBuckets = metrics.numBuckets;
-      List<Thread> threads = Lists.newArrayList();
+      final List<Thread> threads = Lists.newArrayList();
+      final List<Throwable> exceptions = Collections.synchronizedList(new ArrayList<Throwable>());
       final AtomicInteger idGenerator = new AtomicInteger(0);
       for (int i = 0; i < 8; i++) {
         threads.add(new Thread(() -> {
@@ -213,7 +248,7 @@ public class TestByteToLongHashTable {
               cache.put(key.getBytes(), j);
             }
           } catch (Exception e) {
-            e.printStackTrace();
+            exceptions.add(e);
           }
         }));
       }
