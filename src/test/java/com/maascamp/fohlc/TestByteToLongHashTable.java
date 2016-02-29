@@ -5,6 +5,10 @@ import com.google.common.collect.Lists;
 
 import org.junit.Test;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -12,7 +16,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import jdk.nashorn.internal.ir.annotations.Ignore;
+
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
@@ -260,6 +267,85 @@ public class TestByteToLongHashTable {
         } catch (InterruptedException e) {
         }
       });
+    }
+  }
+
+  @Test
+  public void testPersistRestore() throws IOException {
+    Path path = Paths.get(System.getProperty("java.io.tmpdir"));
+
+    // write to cache and persist it
+    try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
+        .setSize(100L)
+        .build()
+    ) {
+      for (int i = 0; i < 80; i++) {
+        cache.put(String.format("string%d", i).getBytes(), i);
+      }
+      FifoOffHeapLongCache.saveTo(path, cache);
+    }
+
+    // load from persisted cache file and read back values
+    try {
+      FifoOffHeapLongCache cache = FifoOffHeapLongCache.loadFrom(path);
+      try {
+        Long value;
+        for (int i = 0; i < 80; i++) {
+          value = cache.get(String.format("string%d", i).getBytes());
+          assertNotNull(value);
+          assertEquals(value.longValue(), i);
+        }
+      } finally {
+        cache.close();
+      }
+    } catch (ClassNotFoundException e) {
+      throw new RuntimeException("Failed deserializing cache");
+    }
+  }
+
+  @Ignore @Test
+  public void testPersistRestoreLargeCache() throws IOException {
+    Path path = Paths.get(System.getProperty("java.io.tmpdir"));
+
+    // write to cache and persist it
+    try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
+        .setSize(68000000L)
+        .build()
+    ) {
+      long puts = 0L;
+      for (long i = 0; i < 34000000L; i++) {
+        cache.put(String.format("string%d", i).getBytes(), i);
+        puts++;
+      }
+
+      long start = System.nanoTime();
+      FifoOffHeapLongCache.saveTo(path, cache);
+      System.out.println("Finished writing cache in " + ((System.nanoTime() - start) / (double) 1000000000) +  " seconds");
+      System.out.println("Cache size (in bytes): " + cache.getCacheMetrics().sizeInBytes);
+      System.out.println("Persisted " + puts + " entries (" + path.toFile().length() + ") to " + path.toAbsolutePath().toString());
+    }
+
+    // load from persisted cache file and read back values
+    try {
+      long start = System.nanoTime();
+      FifoOffHeapLongCache cache = FifoOffHeapLongCache.loadFrom(path);
+      System.out.println(
+          "Finished loading cache in " + ((System.nanoTime() - start) / (double) 1000000000)
+          + " seconds");
+      System.out.println(
+          "Loaded " + path.toFile().length() + " bytes from " + path.toAbsolutePath().toString());
+      try {
+        Long value;
+        for (long i = 0; i < 34000000L; i++) {
+          value = cache.get(String.format("string%d", i).getBytes());
+          assertNotNull("null key: " + String.format("string%d", i), value);
+          assertEquals(value.longValue(), i);
+        }
+      } finally {
+        cache.close();
+      }
+    } catch (ClassNotFoundException e) {
+      throw new RuntimeException("Failed deserializing cache");
     }
   }
 }

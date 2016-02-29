@@ -7,8 +7,21 @@ import com.sun.istack.internal.NotNull;
 
 import sun.misc.Unsafe;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
 import java.lang.reflect.Field;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ConcurrentModificationException;
+import java.util.EnumSet;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
@@ -34,7 +47,8 @@ import javax.annotation.concurrent.ThreadSafe;
  *
  * This cache explicitly does NOT offer delete/remove key functionality.
  */
-public class FifoOffHeapLongCache implements AutoCloseable {
+public class FifoOffHeapLongCache implements AutoCloseable, Serializable {
+  private static final long serialVersionUID = 2230510888293439124L;
 
   /**
    * Load factor threshold beyond which eviction begins.
@@ -96,26 +110,33 @@ public class FifoOffHeapLongCache implements AutoCloseable {
   private static final int MAX_LOCK_ATTEMPTS = 100;
   private static final int MAX_RETRIES = 10;
 
+  /**
+   * Persistence paths.
+   */
+  private static final String CACHE_STATE_FILE = "fohlc.cache.ser";
+  private static final String MEMORY_ARENA_FILE = "fohlc.arena.ser";
+
   private final Lock evictionLock;
   private final Queue<WriteTask> taskBuffer;
 
   private final long probeMax;
   private final long sizeInBytes;
   private final long numBuckets;
-  private final long memStart;
   private final int neighborhoodSize;
   private final int drainThreshold;
   private final double evictionThreshold;
-  private final Unsafe unsafe;
-  private final HashFunction hashFunction;
-  private final EvictionListener evictionListener;
 
+  private final HashFunction hashFunction;
   private final AtomicLong numEntries = new AtomicLong(0L);
   private final AtomicLong hits = new AtomicLong(0L);
   private final AtomicLong misses = new AtomicLong(0L);
   private final AtomicLong evictions = new AtomicLong(0L);
   private final AtomicLong fifoHead = new AtomicLong(-1L);
   private final AtomicLong fifoTail = new AtomicLong(-1L);
+
+  private transient long memStart;
+  private transient EvictionListener evictionListener;
+  private transient Unsafe unsafe;
 
   private FifoOffHeapLongCache(final Builder builder) {
     this.sizeInBytes = ceilingNextPowerOfTwo(builder.size) * BUCKET_SIZE;
@@ -220,6 +241,101 @@ public class FifoOffHeapLongCache implements AutoCloseable {
    */
   public Long getOldestEntry() {
     return (numEntries.get() == 0) ? null : unsafe.getLong(fifoHead.get() + VALUE_OFFSET);
+  }
+
+  public void setEvictionListener(EvictionListener listener) {
+    this.evictionListener = listener;
+  }
+
+  /**
+   * Writes the contents of the allocated memory area to the destination
+   * represented by path.
+   */
+  private void persistOffHeadMemoryTo(Path path) throws IOException {
+    try (FileChannel channel = FileChannel.open(path, EnumSet.of(
+        StandardOpenOption.CREATE,
+        StandardOpenOption.WRITE,
+        StandardOpenOption.TRUNCATE_EXISTING
+    ))) {
+      UnsafeByteChannel ubc = new UnsafeByteChannel(unsafe, memStart, sizeInBytes);
+      long written = 0;
+      while (written < sizeInBytes) {
+        long read = channel.transferFrom(ubc, written, sizeInBytes);
+        if (read == 0) {
+          break;
+        }
+        written += read;
+      }
+      channel.force(true);
+    }
+  }
+
+  /**
+   * Writes the contents of the source represented by path to the
+   * allocated memory area.
+   */
+  private void restoreOffHeadMemoryFrom(Path path) throws IOException {
+    try (FileChannel channel = FileChannel.open(path, EnumSet.of(
+        StandardOpenOption.READ
+    ))) {
+      UnsafeByteChannel ubc = new UnsafeByteChannel(unsafe, memStart, sizeInBytes);
+      long read = 0;
+      while (read < sizeInBytes) {
+        long written = channel.transferTo(read, sizeInBytes, ubc);
+        if (written == 0) {
+          break;
+        }
+        read += written;
+      }
+    }
+  }
+
+  public static void saveTo(Path path, FifoOffHeapLongCache cache)
+      throws IOException {
+
+    File storageDir = path.toFile();
+    if (!storageDir.exists()) {
+      // specified path doesn't exist to make it
+      storageDir.mkdirs();
+    } else if (!storageDir.isDirectory() || !storageDir.canWrite()) {
+      throw new IllegalArgumentException(
+          String.format("%s is not a writeable directory", storageDir.getAbsolutePath())
+      );
+    }
+
+    File destination = new File(storageDir, CACHE_STATE_FILE);
+    Files.deleteIfExists(destination.toPath());
+    FileOutputStream fs = new FileOutputStream(destination);
+    ObjectOutputStream os = new ObjectOutputStream(fs);
+    cache.persistOffHeadMemoryTo(new File(storageDir, MEMORY_ARENA_FILE).toPath());
+    os.writeObject(cache);
+    os.close();
+    fs.close();
+  }
+
+  public static FifoOffHeapLongCache loadFrom(Path path)
+      throws IOException, ClassNotFoundException {
+
+    File storageDir = path.toFile();
+    if (!storageDir.exists()
+        || !storageDir.isDirectory()
+        || !storageDir.canRead()) {
+      throw new IllegalArgumentException(
+          String.format("%s is not a readable directory", storageDir.getAbsolutePath())
+      );
+    }
+
+
+
+    FileInputStream fs = new FileInputStream(
+        new File(storageDir, CACHE_STATE_FILE));
+    ObjectInputStream is = new ObjectInputStream(fs);
+    FifoOffHeapLongCache cache = (FifoOffHeapLongCache) is.readObject();
+    cache.restoreOffHeadMemoryFrom(new File(storageDir, MEMORY_ARENA_FILE).toPath());
+    is.close();
+    fs.close();
+
+    return cache;
   }
 
   /**
@@ -736,7 +852,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
    * Returns the Unsafe singleton.
    * @return sun.misc.Unsafe
    */
-  private static Unsafe getUnsafe() {
+  private Unsafe getUnsafe() {
     try {
       return Unsafe.getUnsafe();
     } catch (SecurityException firstUse) {
@@ -805,7 +921,7 @@ public class FifoOffHeapLongCache implements AutoCloseable {
   /* ---------------- Eviction Listener -------------- */
 
   @ThreadSafe
-  public interface EvictionListener {
+  public interface EvictionListener extends Serializable {
 
     /**
      * Called once for each evicted entry.
@@ -916,6 +1032,19 @@ public class FifoOffHeapLongCache implements AutoCloseable {
 
       return new FifoOffHeapLongCache(this);
     }
+  }
+
+  private void readObject(ObjectInputStream inputStream) throws ClassNotFoundException, IOException {
+    inputStream.defaultReadObject();
+
+    this.unsafe = getUnsafe();
+    this.memStart = this.unsafe.allocateMemory(this.sizeInBytes);
+    this.unsafe.setMemory(this.memStart, this.sizeInBytes, (byte) 0); // zero out memory
+    this.evictionListener = new NoopEvictionListener();
+  }
+
+  private void writeObject(ObjectOutputStream outputStream) throws IOException {
+    outputStream.defaultWriteObject();
   }
 
   private static class PossibleDeadlockException extends RuntimeException {}
