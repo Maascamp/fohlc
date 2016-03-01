@@ -18,7 +18,6 @@ import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ConcurrentModificationException;
 import java.util.EnumSet;
@@ -114,7 +113,7 @@ public class FifoOffHeapLongCache implements AutoCloseable, Serializable {
    * Persistence paths.
    */
   private static final String CACHE_STATE_FILE = "fohlc.cache.ser";
-  private static final String MEMORY_ARENA_FILE = "fohlc.arena.ser";
+  private static final String MEMORY_STATE_FILE = "fohlc.arena.ser";
 
   private final Lock evictionLock;
   private final Queue<WriteTask> taskBuffer;
@@ -307,7 +306,7 @@ public class FifoOffHeapLongCache implements AutoCloseable, Serializable {
     Files.deleteIfExists(destination.toPath());
     FileOutputStream fs = new FileOutputStream(destination);
     ObjectOutputStream os = new ObjectOutputStream(fs);
-    cache.persistOffHeadMemoryTo(new File(storageDir, MEMORY_ARENA_FILE).toPath());
+    cache.persistOffHeadMemoryTo(new File(storageDir, MEMORY_STATE_FILE).toPath());
     os.writeObject(cache);
     os.close();
     fs.close();
@@ -325,13 +324,24 @@ public class FifoOffHeapLongCache implements AutoCloseable, Serializable {
       );
     }
 
+    // verify state files exist
+    File cacheState = new File(storageDir, CACHE_STATE_FILE);
+    if (!cacheState.exists()) {
+      throw new IllegalArgumentException(
+          String.format("%s does not contain %s", storageDir.getAbsolutePath(), cacheState.getName())
+      );
+    }
+    File memState = new File(storageDir, MEMORY_STATE_FILE);
+    if (!memState.exists()) {
+      throw new IllegalArgumentException(
+          String.format("%s does not contain %s", storageDir.getAbsolutePath(), memState.getName())
+      );
+    }
 
-
-    FileInputStream fs = new FileInputStream(
-        new File(storageDir, CACHE_STATE_FILE));
+    FileInputStream fs = new FileInputStream(cacheState);
     ObjectInputStream is = new ObjectInputStream(fs);
     FifoOffHeapLongCache cache = (FifoOffHeapLongCache) is.readObject();
-    cache.restoreOffHeadMemoryFrom(new File(storageDir, MEMORY_ARENA_FILE).toPath());
+    cache.restoreOffHeadMemoryFrom(memState.toPath());
     is.close();
     fs.close();
 
