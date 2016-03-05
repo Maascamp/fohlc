@@ -814,6 +814,10 @@ public class FifoOffHeapLongCache implements AutoCloseable, Serializable {
     return (index * BUCKET_SIZE) + memStart;
   }
 
+  private long indexFromAddress(long address) {
+    return (address - memStart) / BUCKET_SIZE;
+  }
+
   /**
    * Generate a 64 bit hash code from the specified byte array.
    *
@@ -1044,16 +1048,22 @@ public class FifoOffHeapLongCache implements AutoCloseable, Serializable {
     }
   }
 
+  /* ---------------- Serialization -------------- */
+
   private void readObject(ObjectInputStream inputStream) throws ClassNotFoundException, IOException {
     inputStream.defaultReadObject();
 
     this.unsafe = getUnsafe();
     this.memStart = this.unsafe.allocateMemory(this.sizeInBytes);
+    this.fifoHead.set(addressFromIndex(fifoHead.get()));
+    this.fifoTail.set(addressFromIndex(fifoTail.get()));
     this.unsafe.setMemory(this.memStart, this.sizeInBytes, (byte) 0); // zero out memory
     this.evictionListener = new NoopEvictionListener();
   }
 
   private void writeObject(ObjectOutputStream outputStream) throws IOException {
+    this.fifoHead.set(indexFromAddress(fifoHead.get()));
+    this.fifoTail.set(indexFromAddress(fifoTail.get()));
     outputStream.defaultWriteObject();
   }
 
