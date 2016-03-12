@@ -288,6 +288,7 @@ public class TestByteToLongHashTable {
     // load from persisted cache file and read back values
     try {
       FifoOffHeapLongCache cache = FifoOffHeapLongCache.loadFrom(path);
+      assertEquals(cache.getOldestEntry().longValue(), 0L);
       try {
         Long value;
         for (int i = 0; i < 80; i++) {
