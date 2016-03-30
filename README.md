@@ -10,7 +10,7 @@ resolution and uses the 128 bit version of [MurmurHash3](https://code.google.com
 
 The bookkeeping strategy for managing linked list pointers and eviction is modeled on
 the [ConcurrentLinkedHashMap design](https://github.com/ben-manes/concurrentlinkedhashmap/wiki/Design) which amortizes bookkeeping and 
-eviction across threads. We aim to keep the load factor between 0.8 and 0.85.
+eviction across threads. The default target load factor is 0.8, but can be configured.
 
 Puts into FifoOffHeapLongCache are only written if the key does not currently exist in the cache. 
 Note that FifoOffHeapLongCache explicitly does NOT offer delete/remove key functionality.
