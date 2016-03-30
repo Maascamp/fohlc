@@ -16,7 +16,8 @@ Puts into FifoOffHeapLongCache are only written if the key does not currently ex
 Note that FifoOffHeapLongCache explicitly does NOT offer delete/remove key functionality.
 
 FifoOffHeapLongCache was built for large (>10GB) caches and stores all key, value, and pointer data 
-off-heap in pre-allocated memory in order to minimize GC overhead. *NOTE: you __must__ call `destroy`
+off-heap in pre-allocated memory in order to minimize GC overhead. There are also APIs provided for 
+saving the cache to and restoring the cache from disk if persistence is required. *NOTE: you __must__ call `destroy`
 on the cache or use it in a try-with-resources block (in which case `destroy` will be called for you)
 or any allocated memory will not be released.*
 
