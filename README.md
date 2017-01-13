@@ -23,8 +23,19 @@ or any allocated memory will not be released.*
 
 ####Usage
 ```java
+// add an Eviction listener to be called when entries are evicted
+FifoOffHeapLongCache.EvictionListener listener = new FifoOffHeapLongCache.EvictionListener() {
+  @Override
+  public void onEvict(long key, long value) {
+    System.out.println(String.format("Evicted entry %d => %d", key, value));
+  }
+};
+
+// build the cache
 try (FifoOffHeapLongCache cache = new FifoOffHeapLongCache.Builder()
   .setSize(100000000L)
+  .setEvictionThreshold(0.80)
+  .setEvictionListener(listener)
   .build()
 ) {
   String key = "key";
